@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 
@@ -15,14 +16,16 @@ namespace ACE.Server.WorldObjects
 {
     partial class Creature
     {
-        public CombatMode CombatMode { get; private set; }
-
         /// <summary>
         /// The list of combat maneuvers performable by this creature
         /// </summary>
         public DatLoader.FileTypes.CombatManeuverTable CombatTable { get; set; }
 
-        public DamageHistory DamageHistory;
+        public CombatMode CombatMode { get; private set; }
+
+        public AttackType AttackType { get; set; }
+
+        public DamageHistory DamageHistory { get; private set; }
 
         /// <summary>
         /// Handles queueing up multiple animation sequences between packets
@@ -121,13 +124,15 @@ namespace ACE.Server.WorldObjects
 
             float peace1 = 0.0f, unarmed = 0.0f, peace2 = 0.0f;
 
+            // this is now handled as a proper 2-step process in HandleActionChangeCombatMode / NextUseTime
+
             // FIXME: just call generic method to switch to HandCombat first
             peace1 = MotionTable.GetAnimationLength(MotionTableId, CurrentMotionState.Stance, MotionCommand.Ready, MotionCommand.NonCombat);
-            if (CurrentMotionState.Stance != MotionStance.HandCombat && combatStance != MotionStance.HandCombat)
+            /*if (CurrentMotionState.Stance != MotionStance.HandCombat && combatStance != MotionStance.HandCombat)
             {
                 unarmed = MotionTable.GetAnimationLength(MotionTableId, MotionStance.NonCombat, MotionCommand.Ready, MotionCommand.HandCombat);
                 peace2 = MotionTable.GetAnimationLength(MotionTableId, MotionStance.HandCombat, MotionCommand.Ready, MotionCommand.NonCombat);
-            }
+            }*/
 
             SetStance(MotionStance.NonCombat, false);
 
@@ -446,6 +451,9 @@ namespace ACE.Server.WorldObjects
         public virtual uint GetEffectiveAttackSkill()
         {
             var attackSkill = GetCreatureSkill(GetCurrentAttackSkill()).Current;
+
+            // TODO: don't use for bow?
+            // https://asheron.fandom.com/wiki/Developer_Chat_-_2002/09/23
             var offenseMod = GetWeaponOffenseModifier(this);
 
             // monsters don't use accuracy mod?
@@ -455,15 +463,18 @@ namespace ACE.Server.WorldObjects
 
         /// <summary>
         /// Returns the effective defense skill for a player or creature,
-        /// ie. with Defender bonus
+        /// ie. with Defender bonus and imbues
         /// </summary>
         public uint GetEffectiveDefenseSkill(CombatType combatType)
         {
             var defenseSkill = combatType == CombatType.Missile ? Skill.MissileDefense : Skill.MeleeDefense;
-            var defenseMod = defenseSkill == Skill.MeleeDefense ? GetWeaponMeleeDefenseModifier(this) : 1.0f;
+            var defenseMod = defenseSkill == Skill.MissileDefense ? GetWeaponMissileDefenseModifier(this) : GetWeaponMeleeDefenseModifier(this);
             var burdenMod = GetBurdenMod();
 
-            var effectiveDefense = (uint)Math.Round(GetCreatureSkill(defenseSkill).Current * defenseMod * burdenMod);
+            var imbuedEffectType = defenseSkill == Skill.MissileDefense ? ImbuedEffectType.MissileDefense : ImbuedEffectType.MeleeDefense;
+            var defenseImbues = GetDefenseImbues(imbuedEffectType);
+
+            var effectiveDefense = (uint)Math.Round(GetCreatureSkill(defenseSkill).Current * defenseMod * burdenMod + defenseImbues);
 
             if (IsExhausted) effectiveDefense = 0;
 
@@ -536,22 +547,54 @@ namespace ACE.Server.WorldObjects
         /// </summary>
         public string GetSplatterDir(WorldObject target)
         {
-            var sourcePos = new Vector3(Location.PositionX, Location.PositionY, 0);
-            var targetPos = new Vector3(target.Location.PositionX, target.Location.PositionY, 0);
-            var targetDir = new AFrame(target.Location.Pos, target.Location.Rotation).get_vector_heading();
+            var quadrant = GetRelativeDir(target);
 
-            targetDir.Z = 0;
-            targetDir = Vector3.Normalize(targetDir);
+            var splatterDir = quadrant.HasFlag(Quadrant.Left) ? "Left" : "Right";
+            splatterDir += quadrant.HasFlag(Quadrant.Front) ? "Front" : "Back";
 
-            var sourceToTarget = Vector3.Normalize(sourcePos - targetPos);
+            return splatterDir;
+        }
 
-            var dir = Vector3.Dot(sourceToTarget, targetDir);
-            var angle = Vector3.Cross(sourceToTarget, targetDir);
+        public double GetLifeResistance(DamageType damageType)
+        {
+            double resistance = 1.0;
 
-            var frontBack = dir >= 0 ? "Front" : "Back";
-            var leftRight = angle.Z <= 0 ? "Left" : "Right";
+            switch (damageType)
+            {
+                case DamageType.Slash:
+                    resistance = ResistSlashMod;
+                    break;
 
-            return leftRight + frontBack;
+                case DamageType.Pierce:
+                    resistance = ResistPierceMod;
+                    break;
+
+                case DamageType.Bludgeon:
+                    resistance = ResistBludgeonMod;
+                    break;
+
+                case DamageType.Fire:
+                    resistance = ResistFireMod;
+                    break;
+
+                case DamageType.Cold:
+                    resistance = ResistColdMod;
+                    break;
+
+                case DamageType.Acid:
+                    resistance = ResistAcidMod;
+                    break;
+
+                case DamageType.Electric:
+                    resistance = ResistElectricMod;
+                    break;
+
+                case DamageType.Nether:
+                    resistance = ResistNetherMod;
+                    break;
+            }
+
+            return resistance;
         }
 
         /// <summary>
@@ -605,7 +648,7 @@ namespace ACE.Server.WorldObjects
 
             // shield AL item enchantment additives:
             // impenetrability, brittlemail
-            var ignoreMagicArmor = weapon != null ? weapon.IgnoreMagicArmor : false;
+            var ignoreMagicArmor = (weapon?.IgnoreMagicArmor ?? false) || (attacker?.IgnoreMagicArmor ?? false);
 
             var modSL = ignoreMagicArmor ? 0 : shield.EnchantmentManager.GetArmorMod();
             var effectiveSL = baseSL + modSL;
@@ -637,6 +680,11 @@ namespace ACE.Server.WorldObjects
                 shieldCap = (uint)Math.Round(shieldCap / 2.0f);
 
             effectiveLevel = Math.Min(effectiveLevel, shieldCap);
+
+            var ignoreShieldMod = attacker.GetIgnoreShieldMod(weapon);
+            //Console.WriteLine($"IgnoreShieldMod: {ignoreShieldMod}");
+
+            effectiveLevel *= ignoreShieldMod;
 
             // SL is multiplied by existing AL
             var shieldMod = SkillFormula.CalcArmorMod(effectiveLevel);
@@ -835,7 +883,7 @@ namespace ACE.Server.WorldObjects
             if (spell.NotFound) return;  // TODO: friendly message to install DF patch
 
             target.EnchantmentManager.Add(spell, this);
-            target.EnqueueBroadcast(new GameMessageScript(target.Guid, ACE.Entity.Enum.PlayScript.DirtyFightingDefenseDebuff));
+            target.EnqueueBroadcast(new GameMessageScript(target.Guid, PlayScript.DirtyFightingDefenseDebuff));
 
             FightDirty_SendMessage(target, spell);
         }
@@ -856,7 +904,7 @@ namespace ACE.Server.WorldObjects
             target.EnchantmentManager.Add(spell, this);
 
             // only send if not already applied?
-            target.EnqueueBroadcast(new GameMessageScript(target.Guid, ACE.Entity.Enum.PlayScript.DirtyFightingDamageOverTime));
+            target.EnqueueBroadcast(new GameMessageScript(target.Guid, PlayScript.DirtyFightingDamageOverTime));
 
             FightDirty_SendMessage(target, spell);
         }
@@ -875,7 +923,7 @@ namespace ACE.Server.WorldObjects
             if (spell.NotFound) return;  // TODO: friendly message to install DF patch
 
             target.EnchantmentManager.Add(spell, this);
-            target.EnqueueBroadcast(new GameMessageScript(target.Guid, ACE.Entity.Enum.PlayScript.DirtyFightingAttackDebuff));
+            target.EnqueueBroadcast(new GameMessageScript(target.Guid, PlayScript.DirtyFightingAttackDebuff));
 
             FightDirty_SendMessage(target, spell);
 
@@ -887,7 +935,7 @@ namespace ACE.Server.WorldObjects
             if (spell.NotFound) return;  // TODO: friendly message to install DF patch
 
             target.EnchantmentManager.Add(spell, this);
-            target.EnqueueBroadcast(new GameMessageScript(target.Guid, ACE.Entity.Enum.PlayScript.DirtyFightingHealDebuff));
+            target.EnqueueBroadcast(new GameMessageScript(target.Guid, PlayScript.DirtyFightingHealDebuff));
 
             FightDirty_SendMessage(target, spell);
         }
@@ -949,14 +997,6 @@ namespace ACE.Server.WorldObjects
                 default:
                     return ResistanceType.Undef;
             }
-        }
-
-        /// <summary>
-        /// Returns the current attack maneuver for a non-player creature
-        /// </summary>
-        public virtual AttackType GetAttackType(WorldObject weapon, CombatManeuver combatManeuver)
-        {
-            return combatManeuver != null ? combatManeuver.AttackType : AttackType.Undef;
         }
 
         public virtual bool CanDamage(Creature target)
@@ -1087,5 +1127,118 @@ namespace ACE.Server.WorldObjects
             }
             return damageTypes;
         }
+
+        /// <summary>
+        /// Flag indicates which overpower formula is used
+        /// True  = Formula A / ratings method
+        /// False = Formula B / critical defense method
+        /// </summary>
+        public static bool OverpowerMethod = false;
+
+        public static bool GetOverpower(Creature attacker, Creature defender)
+        {
+            if (OverpowerMethod)
+                return GetOverpower_Method_A(attacker, defender);
+            else
+                return GetOverpower_Method_B(attacker, defender);
+        }
+
+        public static bool GetOverpower_Method_A(Creature attacker, Creature defender)
+        {
+            // implemented similar to ratings
+            if (attacker.Overpower == null)
+                return false;
+
+            var overpowerChance = attacker.Overpower.Value;
+            if (defender.OverpowerResist != null)
+                overpowerChance -= defender.OverpowerResist.Value;
+
+            //Console.WriteLine($"Overpower chance: {GetOverpowerChance_Method_A(attacker, defender)}");
+
+            if (overpowerChance <= 0)
+                return false;
+
+            var rng = ThreadSafeRandom.Next(0.0f, 1.0f);
+
+            return rng < overpowerChance * 0.01f;
+        }
+
+        public static bool GetOverpower_Method_B(Creature attacker, Creature defender)
+        {
+            // implemented similar to critical defense
+            if (attacker.Overpower == null)
+                return false;
+
+            var overpowerChance = attacker.Overpower.Value;
+
+            //Console.WriteLine($"Overpower chance: {GetOverpowerChance_Method_B(attacker, defender)}");
+
+            var rng = ThreadSafeRandom.Next(0.0f, 1.0f);
+
+            if (rng >= overpowerChance * 0.01f)
+                return false;
+
+            if (defender.OverpowerResist == null)
+                return true;
+
+            var resistChance = defender.OverpowerResist.Value;
+
+            rng = ThreadSafeRandom.Next(0.0f, 1.0f);
+
+            return rng >= resistChance * 0.01f;
+        }
+
+        public static float GetOverpowerChance(Creature attacker, Creature defender)
+        {
+            if (OverpowerMethod)
+                return GetOverpowerChance_Method_A(attacker, defender);
+            else
+                return GetOverpowerChance_Method_B(attacker, defender);
+        }
+
+        public static float GetOverpowerChance_Method_A(Creature attacker, Creature defender)
+        {
+            if (attacker.Overpower == null)
+                return 0.0f;
+
+            var overpowerChance = attacker.Overpower.Value;
+            if (defender.OverpowerResist != null)
+                overpowerChance -= defender.OverpowerResist.Value;
+
+            if (overpowerChance <= 0)
+                return 0.0f;
+
+            return overpowerChance * 0.01f;
+        }
+
+        public static float GetOverpowerChance_Method_B(Creature attacker, Creature defender)
+        {
+            if (attacker.Overpower == null)
+                return 0.0f;
+
+            var overpowerChance = (attacker.Overpower ?? 0) * 0.01f;
+            var overpowerResistChance = (defender.OverpowerResist ?? 0) * 0.01f;
+
+            return overpowerChance * (1.0f - overpowerResistChance);
+        }
+
+        /// <summary>
+        /// Returns the number of equipped items with a particular imbue type
+        /// </summary>
+        public int GetDefenseImbues(ImbuedEffectType imbuedEffectType)
+        {
+            return EquippedObjects.Values.Count(i => i.GetImbuedEffects().HasFlag(imbuedEffectType));
+        }
+
+        /// <summary>
+        /// Returns the cloak the creature has equipped,
+        /// or 'null' if no cloak is equipped
+        /// </summary>
+        public WorldObject EquippedCloak => EquippedObjects.Values.FirstOrDefault(i => i.ValidLocations == EquipMask.Cloak);
+
+        /// <summary>
+        /// Returns TRUE if creature has cloak equipped
+        /// </summary>
+        public bool HasCloakEquipped => EquippedCloak != null;
     }
 }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+using ACE.Common;
 using ACE.Entity;
 using ACE.Entity.Enum;
 using ACE.Server.Managers;
@@ -231,23 +232,15 @@ namespace ACE.Server.Entity
             }
             else
             {
-                if (p != null && p.Fellowship.FellowshipLeaderGuid == FellowshipLeaderGuid)
-                {
-                    FellowshipLeaderGuid = p.Guid.Full;
-                    SendMessageAndUpdate($"{newLeaderName} now leads the fellowship");
-                }
-                else
-                {
-                    var fellowshipMembers = GetFellowshipMembers();
+                var fellowshipMembers = GetFellowshipMembers();
 
-                    if (fellowshipMembers.Count > 0)
-                    {
-                        int newLeaderIndex = ThreadSafeRandom.Next(0, fellowshipMembers.Count - 1);
-                        var fellowGuids = fellowshipMembers.Keys.ToList();
-                        FellowshipLeaderGuid = fellowGuids[newLeaderIndex];
-                        newLeaderName = fellowshipMembers[FellowshipLeaderGuid].Name;
-                        SendMessageAndUpdate($"{newLeaderName} now leads the fellowship");
-                    }
+                if (fellowshipMembers.Count > 0)
+                {
+                    int newLeaderIndex = ThreadSafeRandom.Next(0, fellowshipMembers.Count - 1);
+                    var fellowGuids = fellowshipMembers.Keys.ToList();
+                    FellowshipLeaderGuid = fellowGuids[newLeaderIndex];
+                    newLeaderName = fellowshipMembers[FellowshipLeaderGuid].Name;
+                    SendMessageAndUpdate($"{newLeaderName} now leads the fellowship");
                 }
             }
         }
@@ -385,6 +378,45 @@ namespace ACE.Server.Entity
             }
         }
 
+        /// <summary>
+        /// Splits luminance amongst fellowship members, depending on XP type and fellow settings
+        /// </summary>
+        /// <param name="amount">The input amount of luminance</param>
+        /// <param name="xpType">The type of lumaniance (quest luminance is handled differently)</param>
+        /// <param name="player">The fellowship member who originated the luminance</param>
+        public void SplitLuminance(ulong amount, XpType xpType, ShareType shareType, Player player)
+        {
+            // https://asheron.fandom.com/wiki/Announcements_-_2002/02_-_Fever_Dreams#Letter_to_the_Players_1
+
+            shareType &= ~ShareType.Fellowship;
+
+            if (xpType == XpType.Quest)
+            {
+                // quest luminance is not shared
+                player.GrantLuminance((long)amount, XpType.Quest, shareType);
+            }
+            else
+            {
+                // pre-filter: evenly divide between luminance-eligible fellows
+                var shareableMembers = GetFellowshipMembers().Values.Where(f => f.MaximumLuminance != null).ToList();
+
+                if (shareableMembers.Count == 0)
+                    return;
+
+                var perAmount = (long)Math.Round((double)(amount / (ulong)shareableMembers.Count));
+
+                // further filter to fellows in radar range
+                var inRange = shareableMembers.Intersect(WithinRange(player, true)).ToList();
+
+                foreach (var member in inRange)
+                {
+                    var fellowXpType = player == member ? xpType : XpType.Fellowship;
+
+                    member.GrantLuminance(perAmount, fellowXpType, shareType);
+                }
+            }
+        }
+
         internal double GetMemberSharePercent()
         {
             var fellowshipMembers = GetFellowshipMembers();
@@ -418,9 +450,9 @@ namespace ACE.Server.Entity
 
         /// <summary>
         /// Returns the amount to scale the XP for a fellow
-        /// based on distance from the leader
+        /// based on distance from the earner
         /// </summary>
-        private double GetDistanceScalar(Player earner, Player fellow, XpType xpType)
+        public double GetDistanceScalar(Player earner, Player fellow, XpType xpType)
         {
             if (earner == null || fellow == null)
                 return 0.0f;
@@ -428,10 +460,17 @@ namespace ACE.Server.Entity
             if (xpType == XpType.Quest)
                 return 1.0f;
 
-            var earnerPosition = earner.Location;
-            var fellowPosition = fellow.Location;
+            // https://asheron.fandom.com/wiki/Announcements_-_2004/01_-_Mirror,_Mirror#Rollout_Article
 
-            var dist = fellowPosition.Distance2D(earnerPosition);
+            // If they are indoors while you are outdoors, or vice-versa.
+            if (earner.Location.Indoors != fellow.Location.Indoors)
+                return 0.0f;
+
+            // If you are both indoors but in different landblocks.
+            if (earner.Location.Indoors && fellow.Location.Indoors && earner.Location.Landblock != fellow.Location.Landblock)
+                return 0.0f;
+
+            var dist = earner.Location.Distance2D(fellow.Location);
 
             if (dist >= MaxDistance * 2.0f)
                 return 0.0f;
@@ -439,9 +478,35 @@ namespace ACE.Server.Entity
             if (dist <= MaxDistance)
                 return 1.0f;
 
-            var scalar = 1 - (dist - MaxDistance) / MaxDistance;
+            var scalar = 1.0f - (dist - MaxDistance) / MaxDistance;
 
             return Math.Max(0.0f, scalar);
+        }
+
+        /// <summary>
+        /// Returns fellows within radar range (75 units outdoors, 25 units indoors)
+        /// </summary>
+        public List<Player> WithinRange(Player player, bool includeSelf = false)
+        {
+            var fellows = GetFellowshipMembers();
+
+            var landblockRange = PropertyManager.GetBool("fellow_kt_landblock").Item;
+
+            var results = new List<Player>();
+
+            foreach (var fellow in fellows.Values)
+            {
+                if (player == fellow && !includeSelf)
+                    continue;
+
+                var shareable = player == fellow || landblockRange ?
+                    player.CurrentLandblock == fellow.CurrentLandblock || player.Location.DistanceTo(fellow.Location) <= 192.0f :
+                    player.Location.Distance2D(fellow.Location) <= player.CurrentRadarRange && player.ObjMaint.VisibleObjectsContainsKey(fellow.Guid.Full);      // 2d visible distance / radar range?
+
+                if (shareable)
+                    results.Add(fellow);
+            }
+            return results;
         }
 
         /// <summary>
@@ -514,10 +579,13 @@ namespace ACE.Server.Entity
             {
                 var offlinePlayer = PlayerManager.FindByGuid(fellowGuid);
                 var offlineName = offlinePlayer != null ? offlinePlayer.Name : "NULL";
-                log.Warn($"Dropped fellow: {offlineName}");
 
+                log.Warn($"Dropped fellow: {offlineName}");
                 fellowshipMembers.Remove(fellowGuid);
             }
+            if (fellowGuids.Contains(FellowshipLeaderGuid))
+                AssignNewLeader(null);
+
             CalculateXPSharing();
             UpdateAllMembers();
         }

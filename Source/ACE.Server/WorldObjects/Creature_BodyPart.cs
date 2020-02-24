@@ -6,7 +6,7 @@ using ACE.Database.Models.Shard;
 using ACE.Entity.Enum;
 using ACE.Entity.Enum.Properties;
 using ACE.Server.Entity;
-using ACE.Server.Managers;
+using ACE.Server.WorldObjects.Managers;
 
 namespace ACE.Server.WorldObjects
 {
@@ -26,41 +26,32 @@ namespace ACE.Server.WorldObjects
         /// <summary>
         /// Main entry point for getting the armor mod
         /// </summary>
-        public float GetArmorMod(DamageType damageType, List<WorldObject> armorLayers, WorldObject weapon, float armorRendingMod = 1.0f)
+        public float GetArmorMod(DamageType damageType, List<WorldObject> armorLayers, Creature attacker, WorldObject weapon, float armorRendingMod = 1.0f)
         {
-            var effectiveArmorVsType = GetEffectiveArmorVsType(damageType, armorLayers, weapon, armorRendingMod);
+            var effectiveArmorVsType = GetEffectiveArmorVsType(damageType, armorLayers, attacker, weapon, armorRendingMod);
 
             return SkillFormula.CalcArmorMod(effectiveArmorVsType);
         }
 
-        public float GetEffectiveArmorVsType(DamageType damageType, List<WorldObject> armorLayers, WorldObject weapon, float armorRendingMod = 1.0f)
+        public float GetEffectiveArmorVsType(DamageType damageType, List<WorldObject> armorLayers, Creature attacker, WorldObject weapon, float armorRendingMod = 1.0f)
         {
-            var ignoreMagicArmor  = weapon != null ? weapon.IgnoreMagicArmor : false;
-            var ignoreMagicResist = weapon != null ? weapon.IgnoreMagicResist : false;
+            var ignoreMagicArmor =  (weapon?.IgnoreMagicArmor ?? false)  || (attacker?.IgnoreMagicArmor ?? false);
+            var ignoreMagicResist = (weapon?.IgnoreMagicResist ?? false) || (attacker?.IgnoreMagicResist ?? false);
 
             // get base AL / RL
+            var armorVsType = Biota.BaseArmor * (float)Creature.GetArmorVsType(damageType);
+
+            // additive enchantments:
+            // imperil / armor
             var enchantmentMod = ignoreMagicResist ? 0 : EnchantmentManager.GetBodyArmorMod();
 
-            var baseArmorMod = (float)(Biota.BaseArmor + enchantmentMod);
-
-            // handle armor rending mod here?
-            //if (baseArmorMod > 0)
-                //baseArmorMod *= armorRendingMod;
-
-            // for creatures, can this be modified via enchantments?
-            var armorVsType = Creature.GetArmorVsType(damageType);
-
-            // handle negative baseArmorMod?
-            if (baseArmorMod < 0)
-                armorVsType = 1.0f + (1.0f - armorVsType);
-
-            var effectiveAL = (float)(baseArmorMod * armorVsType);
+            var effectiveAL = armorVsType + enchantmentMod;
 
             // handle monsters w/ multiple layers of armor
             foreach (var armorLayer in armorLayers)
                 effectiveAL += GetArmorMod(armorLayer, damageType, ignoreMagicArmor);
 
-            // Armor Rending reduces physical armor too?
+            // armor rending reduces base armor + all physical armor too?
             if (effectiveAL > 0)
                 effectiveAL *= armorRendingMod;
 

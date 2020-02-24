@@ -14,6 +14,8 @@ namespace ACE.Server.WorldObjects
     {
         public House House { get => ParentLink as House; }
 
+        public override double Default_ChestResetInterval => double.PositiveInfinity;
+
         /// <summary>
         /// A new biota be created taking all of its values from weenie.
         /// </summary>
@@ -50,6 +52,9 @@ namespace ACE.Server.WorldObjects
             if (!(activator is Player player))
                 return new ActivationResult(false);
 
+            if (player.IgnoreHouseBarriers)
+                return new ActivationResult(true);
+
             if (!House.RootHouse.HasPermission(player, true))
             {
                 player.Session.Network.EnqueueSend(new GameEventCommunicationTransientString(player.Session, $"You do not have permission to access {Name}"));
@@ -57,6 +62,32 @@ namespace ACE.Server.WorldObjects
                 return new ActivationResult(false);
             }
             return new ActivationResult(true);
+        }
+
+        /// <summary>
+        /// This event is raised when player adds item to storage
+        /// </summary>
+        protected override void OnAddItem()
+        {
+            //Console.WriteLine("Storage.OnAddItem()");
+
+            if (Inventory.Count > 0)
+            {
+                // Here we explicitly save the storage to the database to prevent item loss.
+                // If the player adds an item to the storage, and the server crashes before the storage has been saved, the item will be lost.
+                SaveBiotaToDatabase();
+            }
+        }
+
+        /// <summary>
+        /// This event is raised when player removes item from storage
+        /// </summary>
+        protected override void OnRemoveItem(WorldObject removedItem)
+        {
+            //Console.WriteLine("Storage.OnRemoveItem()");
+
+            // Here we explicitly save the storage to the database to prevent property desync.
+            SaveBiotaToDatabase();
         }
     }
 }

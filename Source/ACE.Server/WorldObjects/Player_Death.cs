@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+
+using ACE.Common;
 using ACE.DatLoader;
 using ACE.DatLoader.FileTypes;
 using ACE.Entity;
@@ -13,7 +15,6 @@ using ACE.Server.Managers;
 using ACE.Server.Network.Structure;
 using ACE.Server.Network.GameEvent.Events;
 using ACE.Server.Network.GameMessages.Messages;
-using ACE.Common;
 
 namespace ACE.Server.WorldObjects
 {
@@ -30,32 +31,18 @@ namespace ACE.Server.WorldObjects
         /// </summary>
         /// <param name="lastDamager">The last damager that landed the death blow</param>
         /// <param name="damageType">The damage type for the death message</param>
-        public override DeathMessage OnDeath(WorldObject lastDamager, DamageType damageType, bool criticalHit = false)
+        public override DeathMessage OnDeath(DamageHistoryInfo lastDamager, DamageType damageType, bool criticalHit = false)
         {
-            if (DamageHistory.TopDamager is Player pkPlayer)
-            {
-                if (IsPKDeath(pkPlayer))
-                {
-                    pkPlayer.PkTimestamp = Time.GetUnixTime();
-                    pkPlayer.PlayerKillsPk++;
+            var topDamager = DamageHistory.GetTopDamager(false);
 
-                    var globalPKDe = $"{lastDamager.Name} has defeated {Name}!";
-
-                    if ((Location.Cell & 0xFFFF) < 0x100)
-                        globalPKDe += $" The kill occured at {Location.GetMapCoordStr()}";
-
-                    globalPKDe += "\n[PKDe]";
-
-                    PlayerManager.BroadcastToAll(new GameMessageSystemChat(globalPKDe, ChatMessageType.Broadcast));
-                }
-                else if (IsPKLiteDeath(pkPlayer))
-                    pkPlayer.PlayerKillsPkl++;
-            }
+            HandlePKDeathBroadcast(lastDamager, topDamager);
 
             var deathMessage = base.OnDeath(lastDamager, damageType, criticalHit);
 
-            if (lastDamager != null)
-                lastDamager.EmoteManager.OnKill(this);
+            var lastDamagerObj = lastDamager?.TryGetAttacker();
+
+            if (lastDamagerObj != null)
+                lastDamagerObj.EmoteManager.OnKill(this);
 
             var playerMsg = "";
             if (lastDamager != null)
@@ -75,22 +62,22 @@ namespace ACE.Server.WorldObjects
 
             var broadcastMsg = new GameMessageSystemChat(nearbyMsg, ChatMessageType.Broadcast);
 
-            log.Info(nearbyMsg);
+            log.Debug("[CORPSE] " + nearbyMsg);
 
             var excludePlayers = new List<Player>();
-            if (lastDamager is Player lastDamagerPlayer)
+            if (lastDamagerObj is Player lastDamagerPlayer)
                 excludePlayers.Add(lastDamagerPlayer);
 
             var nearbyPlayers = EnqueueBroadcast(excludePlayers, false, broadcastMsg);
 
             excludePlayers.AddRange(nearbyPlayers);
-            excludePlayers.Add(this);   // exclude self
+            excludePlayers.Add(this); // exclude self
 
             if (Fellowship != null)
                 Fellowship.OnDeath(this);
 
             // if the player's lifestone is in a different landblock, also broadcast their demise to that landblock
-            if (Sanctuary != null && Location.Landblock != Sanctuary.Landblock)
+            if (PropertyManager.GetBool("lifestone_broadcast_death").Item && Sanctuary != null && Location.Landblock != Sanctuary.Landblock)
             {
                 // ActionBroadcastKill might not work if other players around lifestone aren't aware of this player yet...
                 // this existing broadcast method is also based on the current visible objects to the player,
@@ -100,10 +87,37 @@ namespace ACE.Server.WorldObjects
                 // instead, we get all of the players in the lifestone landblock + adjacent landblocks,
                 // and possibly limit that to some radius around the landblock?
                 var lifestoneBlock = LandblockManager.GetLandblock(new LandblockId(Sanctuary.Landblock << 16 | 0xFFFF), true);
-                lifestoneBlock.EnqueueBroadcast(excludePlayers, true, broadcastMsg);
+                lifestoneBlock.EnqueueBroadcast(excludePlayers, true, Sanctuary, LocalBroadcastRangeSq, broadcastMsg);
             }
 
             return deathMessage;
+        }
+
+        public void HandlePKDeathBroadcast(DamageHistoryInfo lastDamager, DamageHistoryInfo topDamager)
+        {
+            if (topDamager == null || !topDamager.IsPlayer)
+                return;
+
+            var pkPlayer = topDamager.TryGetAttacker() as Player;
+            if (pkPlayer == null)
+                return;
+
+            if (IsPKDeath(topDamager))
+            {
+                pkPlayer.PkTimestamp = Time.GetUnixTime();
+                pkPlayer.PlayerKillsPk++;
+
+                var globalPKDe = $"{lastDamager.Name} has defeated {Name}!";
+
+                if ((Location.Cell & 0xFFFF) < 0x100)
+                    globalPKDe += $" The kill occured at {Location.GetMapCoordStr()}";
+
+                globalPKDe += "\n[PKDe]";
+
+                PlayerManager.BroadcastToAll(new GameMessageSystemChat(globalPKDe, ChatMessageType.Broadcast));
+            }
+            else if (IsPKLiteDeath(topDamager))
+                pkPlayer.PlayerKillsPkl++;
         }
 
         /// <summary>
@@ -132,11 +146,27 @@ namespace ACE.Server.WorldObjects
         /// Broadcasts the player death animation, updates vitae, and sends network messages for player death
         /// Queues the action to call TeleportOnDeath and enter portal space soon
         /// </summary>
-        protected override void Die(WorldObject lastDamager, WorldObject topDamager)
+        protected override void Die(DamageHistoryInfo lastDamager, DamageHistoryInfo topDamager)
         {
+            if (topDamager?.Guid == Guid && IsPKType)
+            {
+                var topDamagerOther = DamageHistory.GetTopDamager(false);
+
+                if (topDamagerOther != null && topDamagerOther.IsPlayer)
+                    topDamager = topDamagerOther;
+            }
+
             UpdateVital(Health, 0);
             NumDeaths++;
             suicideInProgress = false;
+
+            if (CombatMode == CombatMode.Magic && MagicState.IsCasting)
+                FailCast(false);
+
+            // TODO: instead of setting IsBusy here,
+            // eventually all of the places that check for states such as IsBusy || Teleporting
+            // might want to use a common function, and IsDead should return a separate error
+            IsBusy = true;
 
             // killer = top damager for looting rights
             if (topDamager != null)
@@ -182,11 +212,13 @@ namespace ACE.Server.WorldObjects
             dieChain.AddAction(this, () =>
             {
                 CreateCorpse(topDamager);
-                TeleportOnDeath();      // enter portal space
-                SetLifestoneProtection();
+
+                ThreadSafeTeleportOnDeath(); // enter portal space
 
                 if (IsPKDeath(topDamager) || IsPKLiteDeath(topDamager))
                     SetMinimumTimeSincePK();
+
+                IsBusy = false;
             });
 
             dieChain.EnqueueChain();
@@ -195,40 +227,43 @@ namespace ACE.Server.WorldObjects
         /// <summary>
         /// Called when the player enters portal space after dying
         /// </summary>
-        public void TeleportOnDeath()
+        public void ThreadSafeTeleportOnDeath()
         {
             // teleport to sanctuary or best location
             var newPosition = Sanctuary ?? Instantiation ?? Location;
 
-            Teleport(newPosition);
-
-            // Stand back up
-            SetCombatMode(CombatMode.NonCombat);
-
-            var teleportChain = new ActionChain();
-            teleportChain.AddDelaySeconds(3.0f);
-            teleportChain.AddAction(this, () =>
+            WorldManager.ThreadSafeTeleport(this, newPosition, new ActionEventDelegate(() =>
             {
-                // currently happens while in portal space
-                var newHealth = (uint)Math.Round(Health.MaxValue * 0.75f);
-                var newStamina = (uint)Math.Round(Stamina.MaxValue * 0.75f);
-                var newMana = (uint)Math.Round(Mana.MaxValue * 0.75f);
+                // Stand back up
+                SetCombatMode(CombatMode.NonCombat);
 
-                var msgHealthUpdate = new GameMessagePrivateUpdateAttribute2ndLevel(this, Vital.Health, newHealth);
-                var msgStaminaUpdate = new GameMessagePrivateUpdateAttribute2ndLevel(this, Vital.Stamina, newStamina);
-                var msgManaUpdate = new GameMessagePrivateUpdateAttribute2ndLevel(this, Vital.Mana, newMana);
+                SetLifestoneProtection();
 
-                UpdateVital(Health, newHealth);
-                UpdateVital(Stamina, newStamina);
-                UpdateVital(Mana, newMana);
+                var teleportChain = new ActionChain();
+                teleportChain.AddDelaySeconds(3.0f);
+                teleportChain.AddAction(this, () =>
+                {
+                    // currently happens while in portal space
+                    var newHealth = (uint)Math.Round(Health.MaxValue * 0.75f);
+                    var newStamina = (uint)Math.Round(Stamina.MaxValue * 0.75f);
+                    var newMana = (uint)Math.Round(Mana.MaxValue * 0.75f);
 
-                Session.Network.EnqueueSend(msgHealthUpdate, msgStaminaUpdate, msgManaUpdate);
+                    var msgHealthUpdate = new GameMessagePrivateUpdateAttribute2ndLevel(this, Vital.Health, newHealth);
+                    var msgStaminaUpdate = new GameMessagePrivateUpdateAttribute2ndLevel(this, Vital.Stamina, newStamina);
+                    var msgManaUpdate = new GameMessagePrivateUpdateAttribute2ndLevel(this, Vital.Mana, newMana);
 
-                // reset damage history for this player
-                DamageHistory.Reset();
-            });
+                    UpdateVital(Health, newHealth);
+                    UpdateVital(Stamina, newStamina);
+                    UpdateVital(Mana, newMana);
 
-            teleportChain.EnqueueChain();
+                    Session.Network.EnqueueSend(msgHealthUpdate, msgStaminaUpdate, msgManaUpdate);
+
+                    // reset damage history for this player
+                    DamageHistory.Reset();
+                });
+
+                teleportChain.EnqueueChain();
+            }));
         }
 
         private bool suicideInProgress;
@@ -250,7 +285,7 @@ namespace ACE.Server.WorldObjects
             suicideInProgress = true;
 
             if (PropertyManager.GetBool("suicide_instant_death").Item)
-                Die(this, DamageHistory.TopDamager);
+                Die(new DamageHistoryInfo(this), DamageHistory.TopDamager);
             else
                 HandleSuicide(NumDeaths);
         }
@@ -279,7 +314,7 @@ namespace ACE.Server.WorldObjects
                 suicideChain.EnqueueChain();
             }
             else
-                Die(this, DamageHistory.TopDamager);
+                Die(new DamageHistoryInfo(this), DamageHistory.TopDamager);
         }
 
         public List<WorldObject> CalculateDeathItems(Corpse corpse)
@@ -413,7 +448,10 @@ namespace ACE.Server.WorldObjects
             // if player dies in a PKLite battle,
             // they don't drop any items, and revert back to NPK status
 
-            if (IsPKLiteDeath(corpse.KillerId))
+            // if player dies on a No Drop landblock,
+            // they don't drop any items
+
+            if (corpse.IsOnNoDropLandblock || IsPKLiteDeath(corpse.KillerId))
                 return new List<WorldObject>();
 
             var numItemsDropped = GetNumItemsDropped(corpse);
@@ -431,7 +469,7 @@ namespace ACE.Server.WorldObjects
 
             // exclude wielded items if < level 35
             if (!canDropWielded)
-                inventory = inventory.Where(i => i.CurrentWieldedLocation != null).ToList();
+                inventory = inventory.Where(i => i.CurrentWieldedLocation == null).ToList();
 
             // exclude bonded items
             inventory = inventory.Where(i => (i.GetProperty(PropertyInt.Bonded) ?? 0) == 0).ToList();
@@ -447,7 +485,7 @@ namespace ACE.Server.WorldObjects
             if (numCoinsDropped > 0)
             {
                 // add pyreals to dropped items
-                var pyreals = SpendCurrency((uint)numCoinsDropped, WeenieType.Coin);
+                var pyreals = SpendCurrency(Vendor.CoinStackWCID, (uint)numCoinsDropped);
                 dropItems.AddRange(pyreals);
                 //Console.WriteLine($"Dropping {numCoinsDropped} pyreals");
             }
@@ -507,7 +545,10 @@ namespace ACE.Server.WorldObjects
             {
                 // coins already removed from SpendCurrency
                 if (destroyCoins && dropItem.WeenieType == WeenieType.Coin)
+                {
+                    dropItem.Destroy();
                     continue;
+                }
 
                 if (!corpse.TryAddToInventory(dropItem))
                 {
@@ -527,25 +568,25 @@ namespace ACE.Server.WorldObjects
             {
                 Session.Network.EnqueueSend(new GameMessageSystemChat(dropList, ChatMessageType.Broadcast));
 
-                DeathItemLog(dropItems);
+                DeathItemLog(dropItems, corpse);
             }
 
             return dropItems;
         }
 
-        public void DeathItemLog(List<WorldObject> dropItems)
+        public void DeathItemLog(List<WorldObject> dropItems, Corpse corpse)
         {
             if (dropItems.Count == 0)
                 return;
 
-            var msg = $"{Name} dropped items on corpse: ";
+            var msg = $"[CORPSE] {Name} dropped items on corpse (0x{corpse.Guid}): ";
 
             foreach (var dropItem in dropItems)
                 msg += $"{(dropItem.StackSize.HasValue && dropItem.StackSize > 1 ? dropItem.StackSize.Value.ToString("N0") + " " + dropItem.GetPluralName() : dropItem.Name)} (0x{dropItem.Guid}){(dropItem.WeenieClassId == 273 && PropertyManager.GetBool("corpse_destroy_pyreals").Item ? $" which {(dropItem.StackSize.HasValue && dropItem.StackSize > 1 ? "were" : "was")} destroyed" : "")}, ";
 
             msg = msg.Substring(0, msg.Length - 2);
 
-            log.Info(msg);
+            log.Debug(msg);
         }
 
         /// <summary>
@@ -844,7 +885,7 @@ namespace ACE.Server.WorldObjects
         public void HandleLifestoneProtection()
         {
             Session.Network.EnqueueSend(new GameEventWeenieError(Session, WeenieError.LifestoneMagicProtectsYou));
-            EnqueueBroadcast(new GameMessageScript(Guid, ACE.Entity.Enum.PlayScript.ShieldUpBlue));
+            EnqueueBroadcast(new GameMessageScript(Guid, PlayScript.ShieldUpBlue));
         }
 
         public static TimeSpan LifestoneProtectionTime = TimeSpan.FromMinutes(1);
@@ -951,7 +992,7 @@ namespace ACE.Server.WorldObjects
         {
             var allPossessions = GetAllPossessions();
 
-            return allPossessions.Where(i => (i.Bonded ?? 0) == (int)BondedStatus.Slippery).ToList();
+            return allPossessions.Where(i => i.Bonded == BondedStatus.Slippery).ToList();
         }
 
         public List<WorldObject> HandleDestroyBonded()
@@ -959,7 +1000,7 @@ namespace ACE.Server.WorldObjects
             var destroyedItems = new List<WorldObject>();
 
             var allPossessions = GetAllPossessions();
-            foreach (var destroyItem in allPossessions.Where(i => (i.Bonded ?? 0) == (int)BondedStatus.Destroy).ToList())
+            foreach (var destroyItem in allPossessions.Where(i => i.Bonded == BondedStatus.Destroy).ToList())
             {
                 TryConsumeFromInventoryWithNetworking(destroyItem, (destroyItem.StackSize ?? 1));
                 destroyedItems.Add(destroyItem);

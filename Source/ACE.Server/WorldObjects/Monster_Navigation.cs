@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 
+using ACE.Common;
 using ACE.Entity;
 using ACE.Entity.Enum;
 using ACE.Entity.Enum.Properties;
@@ -60,7 +61,6 @@ namespace ACE.Server.WorldObjects
 
         public bool DebugMove;
 
-        public bool InitSticky;
         public bool Sticky;
 
         public double NextMoveTime;
@@ -88,7 +88,7 @@ namespace ACE.Server.WorldObjects
 
             // send network actions
             var targetDist = GetDistanceToTarget();
-            var turnTo = IsRanged || (CurrentAttack == CombatType.Magic && targetDist <= GetSpellMaxRange());
+            var turnTo = IsRanged || (CurrentAttack == CombatType.Magic && targetDist <= GetSpellMaxRange()) || AiImmobile;
             if (turnTo)
                 TurnTo(AttackTarget);
             else
@@ -102,18 +102,9 @@ namespace ACE.Server.WorldObjects
 
             var mvp = GetMovementParameters();
             if (turnTo)
-                PhysicsObj.TurnToObject(AttackTarget.PhysicsObj.ID, mvp);
+                PhysicsObj.TurnToObject(AttackTarget.PhysicsObj, mvp);
             else
                 PhysicsObj.MoveToObject(AttackTarget.PhysicsObj, mvp);
-
-            if (!InitSticky)
-            {
-                PhysicsObj.add_moveto_listener(OnMoveComplete);
-
-                PhysicsObj.add_sticky_listener(OnSticky);
-                PhysicsObj.add_unsticky_listener(OnUnsticky);
-                InitSticky = true;
-            }
         }
 
         /// <summary>
@@ -142,7 +133,7 @@ namespace ACE.Server.WorldObjects
         /// <summary>
         /// Called when the MoveTo process has completed
         /// </summary>
-        public virtual void OnMoveComplete(WeenieError status)
+        public override void OnMoveComplete(WeenieError status)
         {
             if (DebugMove)
                 Console.WriteLine($"{Name} ({Guid}) - OnMoveComplete({status})");
@@ -150,10 +141,17 @@ namespace ACE.Server.WorldObjects
             if (status != WeenieError.None)
                 return;
 
+            if (AiImmobile && CurrentAttack == CombatType.Melee)
+            {
+                var targetDist = GetDistanceToTarget();
+                if (targetDist > MaxRange)
+                    ResetAttack();
+            }
+
             if (MonsterState == State.Return)
                 Sleep();
 
-            PhysicsObj.CachedVelocity = Vector3.Zero;   // ??
+            PhysicsObj.CachedVelocity = Vector3.Zero;
             IsMoving = false;
         }
 
@@ -241,7 +239,7 @@ namespace ACE.Server.WorldObjects
             //if (!IsRanged)
                 UpdatePosition();
 
-            if (GetDistanceToTarget() >= MaxChaseRange && MonsterState != State.Return)
+            if (MonsterState == State.Awake && GetDistanceToTarget() >= MaxChaseRange)
             {
                 CancelMoveTo();
                 FindNextTarget();
@@ -256,9 +254,9 @@ namespace ACE.Server.WorldObjects
 
         public void UpdatePosition()
         {
-            ServerPerformanceMonitor.ResumeEvent(ServerPerformanceMonitor.MonitorType.Monster_Navigation_UpdatePosition_PUO);
+            stopwatch.Restart();
             PhysicsObj.update_object();
-            ServerPerformanceMonitor.PauseEvent(ServerPerformanceMonitor.MonitorType.Monster_Navigation_UpdatePosition_PUO);
+            ServerPerformanceMonitor.AddToCumulativeEvent(ServerPerformanceMonitor.CumulativeEventHistoryType.Monster_Navigation_UpdatePosition_PUO, stopwatch.Elapsed.TotalSeconds);
             UpdatePosition_SyncLocation();
 
             //SendUpdatePosition(ForcePos);
@@ -342,8 +340,24 @@ namespace ACE.Server.WorldObjects
         /// </summary>
         public float GetRunRate()
         {
+            var burden = 0.0f;
+
+            // assuming burden only applies to players...
+            if (this is Player player)
+            {
+                var strength = Strength.Current;
+
+                var capacity = EncumbranceSystem.EncumbranceCapacity((int)strength, player.AugmentationIncreasedCarryingCapacity);
+                burden = EncumbranceSystem.GetBurden(capacity, EncumbranceVal ?? 0);
+
+                // TODO: find this exact formula in client
+                // technically this would be based on when the player releases / presses the movement key after stamina > 0
+                if (player.IsExhausted)
+                    burden = 3.0f;
+            }
+
             var runSkill = GetCreatureSkill(Skill.Run).Current;
-            var runRate = MovementSystem.GetRunRate(0.0f, (int)runSkill, 1.0f);
+            var runRate = MovementSystem.GetRunRate(burden, (int)runSkill, 1.0f);
 
             return (float)runRate;
         }
@@ -391,7 +405,7 @@ namespace ACE.Server.WorldObjects
             // set non-default params for monster movement
             mvp.Flags &= ~MovementParamFlags.CanWalk;
 
-            var turnTo = IsRanged || (CurrentAttack == CombatType.Magic && GetDistanceToTarget() <= GetSpellMaxRange());
+            var turnTo = IsRanged || (CurrentAttack == CombatType.Magic && GetDistanceToTarget() <= GetSpellMaxRange()) || AiImmobile;
 
             if (!turnTo)
                 mvp.Flags |= MovementParamFlags.FailWalk | MovementParamFlags.UseFinalHeading | MovementParamFlags.Sticky | MovementParamFlags.MoveAway;
@@ -399,13 +413,13 @@ namespace ACE.Server.WorldObjects
             return mvp;
         }
 
-        public void OnSticky()
+        public override void OnSticky()
         {
             //Console.WriteLine($"{Name} ({Guid}) - OnSticky");
             Sticky = true;
         }
 
-        public void OnUnsticky()
+        public override void OnUnsticky()
         {
             //Console.WriteLine($"{Name} ({Guid}) - OnUnsticky");
             Sticky = false;
@@ -452,16 +466,15 @@ namespace ACE.Server.WorldObjects
             var homeDistSq = Vector3.DistanceSquared(globalHomePos, globalPos);
 
             if (homeDistSq > HomeRadiusSq)
-            {
-                EmoteManager.OnHomeSick(AttackTarget);
                 MoveToHome();
-            }
         }
 
         public void MoveToHome()
         {
             if (DebugMove)
                 Console.WriteLine($"{Name}.MoveToHome()");
+
+            var prevAttackTarget = AttackTarget;
 
             MonsterState = State.Return;
             AttackTarget = null;
@@ -476,13 +489,18 @@ namespace ACE.Server.WorldObjects
 
             NextCancelTime = Timers.RunningTime + 5.0f;
 
-            MoveTo(home, RunRate, false);
+            MoveTo(home, RunRate, false, 1.0f);
+
+            var homePos = new Physics.Common.Position(home);
 
             var mvp = GetMovementParameters();
             mvp.DistanceToObject = 0.6f;
+            mvp.DesiredHeading = homePos.Frame.get_heading();
 
-            PhysicsObj.MoveToPosition(new Physics.Common.Position(home), mvp);
+            PhysicsObj.MoveToPosition(homePos, mvp);
             IsMoving = true;
+
+            EmoteManager.OnHomeSick(prevAttackTarget);
         }
 
         public void CancelMoveTo()

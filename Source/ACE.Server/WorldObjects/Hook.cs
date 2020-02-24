@@ -57,33 +57,36 @@ namespace ACE.Server.WorldObjects
             if (!(activator is Player player))
                 return new ActivationResult(false);
 
-            if (!(House.HouseHooksVisible ?? true) && Item != null && (!(Item is Hooker || Item is Book)))
+            if (player.IgnoreHouseBarriers)
+                return new ActivationResult(true);
+
+            var rootHouse = House.RootHouse;
+            var houseOwner = rootHouse.HouseOwner;
+
+            var houseHooksVisible = rootHouse.HouseHooksVisible ?? true;
+
+            if (!houseHooksVisible)
             {
-                if (HouseOwner.HasValue && (player.Guid.Full == HouseOwner.Value || player.House != null && player.House.HouseOwner == HouseOwner))
+                if (Item is Hooker || Item is Book)
+                {
+                    // redirect to item.CheckUseRequirements
+                    return Item.CheckUseRequirements(activator);
+                }
+
+                if (houseOwner != null && (player.Guid.Full == houseOwner || player.House?.HouseOwner == houseOwner))
                     return new ActivationResult(new GameEventWeenieErrorWithString(player.Session, WeenieErrorWithString.ItemUnusableOnHook_CanOpen, Name));
                 else
                     return new ActivationResult(new GameEventWeenieErrorWithString(player.Session, WeenieErrorWithString.ItemUnusableOnHook_CannotOpen, Name));
             }
 
-            if (!(House.HouseHooksVisible ?? true) && Item != null)
-            {
-                // redirect to item.CheckUseRequirements
-                return Item.CheckUseRequirements(activator);
-            }
-
-            if (!HouseOwner.HasValue || HouseOwner == 0 || (player.Guid.Full != HouseOwner.Value && player.House != null && player.House.HouseOwner != HouseOwner)) // Only HouseOwners can open hooks to add/remove items
+            if (player.House == null || houseOwner == null || (player.Guid.Full != houseOwner && player.House?.HouseOwner != houseOwner))
             {
                 if (Item == null)
                     return new ActivationResult(new GameEventWeenieError(player.Session, WeenieError.HookItemNotUsable_CannotOpen));
-                else if (Item != null && !(Item is Hooker))
-                     return new ActivationResult(new GameEventWeenieErrorWithString(player.Session, WeenieErrorWithString.ItemUnusableOnHook_CannotOpen, Name));
-                else
+                else if (Item is Hooker)
                     return new ActivationResult(new GameEventWeenieError(player.Session, WeenieError.YouAreNotPermittedToUseThatHook));
-            }
-
-            if (!(House.HouseHooksVisible ?? true) && Item == null && HouseOwner > 0 && (player.Guid.Full == HouseOwner.Value || player.House != null && player.House.HouseOwner == HouseOwner)) // Only HouseOwners can open hooks to add/remove items, but hooks must be visible
-            {
-                return new ActivationResult(new GameEventWeenieError(player.Session, WeenieError.HookItemNotUsable_CanOpen));
+                else
+                    return new ActivationResult(new GameEventWeenieErrorWithString(player.Session, WeenieErrorWithString.ItemUnusableOnHook_CannotOpen, Name));
             }
 
             return new ActivationResult(true);
@@ -91,7 +94,7 @@ namespace ACE.Server.WorldObjects
 
         public override void ActOnUse(WorldObject wo)
         {
-            if (!(House.HouseHooksVisible ?? true) && Item != null)
+            if (!(House.RootHouse.HouseHooksVisible ?? true) && Item != null)
             {
                 if (wo is Player player)
                     player.LasUsedHookId = Guid;
@@ -107,7 +110,7 @@ namespace ACE.Server.WorldObjects
 
         protected override void OnInitialInventoryLoadCompleted()
         {
-            var hidden = !(House.HouseHooksVisible ?? true);
+            var hidden = !(House.RootHouse.HouseHooksVisible ?? true);
 
             Ethereal = !HasItem;
             if (!HasItem)
@@ -158,7 +161,7 @@ namespace ACE.Server.WorldObjects
 
             item.EmoteManager.SetProxy(this);
 
-            // Here we explicilty save the hook to the database to prevent item loss.
+            // Here we explicitly save the hook to the database to prevent item loss.
             // If the player adds an item to the hook, and the server crashes before the hook has been saved, the item will be lost.
             SaveBiotaToDatabase();
 
@@ -200,6 +203,9 @@ namespace ACE.Server.WorldObjects
             removedItem.EmoteManager.ClearProxy();
 
             EnqueueBroadcast(new GameMessageUpdateObject(this));
+
+            // Here we explicitly save the storage to the database to prevent property desync.
+            SaveBiotaToDatabase();
         }
 
         public override MotionCommand MotionPickup

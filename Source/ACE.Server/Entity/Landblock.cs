@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using System.Threading;
@@ -9,7 +10,7 @@ using System.Threading.Tasks;
 
 using log4net;
 
-using ACE.Common;
+using ACE.Common.Performance;
 using ACE.Database;
 using ACE.Database.Models.Shard;
 using ACE.Database.Models.World;
@@ -104,14 +105,14 @@ namespace ACE.Server.Entity
         /// <summary>
         /// Landblocks which have been inactive for this many seconds will be unloaded
         /// </summary>
-        private static readonly TimeSpan unloadInterval = TimeSpan.FromMinutes(5);
+        public static readonly TimeSpan UnloadInterval = TimeSpan.FromMinutes(5);
 
 
         /// <summary>
         /// The clientlib backing store landblock
         /// Eventually these classes could be merged, but for now they are separate...
         /// </summary>
-        public Physics.Common.Landblock _landblock { get; private set; }
+        public Physics.Common.Landblock PhysicsLandblock { get; }
 
         public CellLandblock CellLandblock { get; }
         public LandblockInfo LandblockInfo { get; }
@@ -135,6 +136,10 @@ namespace ACE.Server.Entity
         private DateTime last1hClear;
         private bool monitorsRequireEventStart = true;
 
+        // Used for cumulative ServerPerformanceMonitor event recording
+        private readonly Stopwatch stopwatch = new Stopwatch();
+
+
         private EnvironChangeType fogColor;
 
         public EnvironChangeType FogColor
@@ -143,14 +148,12 @@ namespace ACE.Server.Entity
             {
                 if (LandblockManager.GlobalFogColor.HasValue)
                     return LandblockManager.GlobalFogColor.Value;
-                else
-                    return fogColor;
+
+                return fogColor;
             }
-            set
-            {
-                fogColor = value;
-            }
+            set => fogColor = value;
         }
+
 
         public Landblock(LandblockId id)
         {
@@ -163,10 +166,17 @@ namespace ACE.Server.Entity
 
             lastActiveTime = DateTime.UtcNow;
 
+            var cellLandblock = DBObj.GetCellLandblock(Id.Raw | 0xFFFF);
+            PhysicsLandblock = new Physics.Common.Landblock(cellLandblock);
+        }
+
+        public void Init(bool reload = false)
+        {
+            if (!reload)
+                PhysicsLandblock.PostInit();
+
             Task.Run(() =>
             {
-                _landblock = LScape.get_landblock(Id.Raw);
-
                 CreateWorldObjects();
 
                 SpawnDynamicShardObjects();
@@ -222,7 +232,7 @@ namespace ACE.Server.Entity
 
                 CreateWorldObjectsCompleted = true;
 
-                _landblock.SortObjects();
+                PhysicsLandblock.SortObjects();
             }));
         }
 
@@ -265,7 +275,7 @@ namespace ACE.Server.Entity
                 pos.Frame = new Physics.Animation.AFrame(new Vector3(xPos, yPos, 0), Quaternion.Identity);
                 pos.adjust_to_outside();
 
-                pos.Frame.Origin.Z = _landblock.GetZ(pos.Frame.Origin);
+                pos.Frame.Origin.Z = PhysicsLandblock.GetZ(pos.Frame.Origin);
 
                 wo.Location = new Position(pos.ObjCellID, pos.Frame.Origin, pos.Frame.Orientation);
 
@@ -354,88 +364,66 @@ namespace ACE.Server.Entity
             Scenery = Entity.Scenery.Load(this);
         }
 
+        /// <summary>
+        /// This should be called before TickLandblockGroupThreadSafeWork() and before Tick()
+        /// </summary>
         public void TickPhysics(double portalYearTicks, ConcurrentBag<WorldObject> movedObjects)
         {
-            Monitor5m.RegisterEventStart();
-            Monitor1h.RegisterEventStart();
+            if (IsDormant)
+                return;
+
+            Monitor5m.Restart();
+            Monitor1h.Restart();
             monitorsRequireEventStart = false;
 
-            foreach (WorldObject wo in GetWorldObjectsForPhysicsHandling())
+            ProcessPendingWorldObjectAdditionsAndRemovals();
+
+            foreach (WorldObject wo in worldObjects.Values)
             {
                 // set to TRUE if object changes landblock
-                var landblockUpdate = false;
-
-                // detect player movement
-                // TODO: handle players the same as everything else
-                if (wo is Player player)
-                {
-                    wo.InUpdate = true;
-
-                    var newPosition = HandlePlayerPhysics(player);
-
-                    // update position through physics engine
-                    if (newPosition != null)
-                        landblockUpdate = wo.UpdatePlayerPhysics(newPosition);
-
-                    wo.InUpdate = false;
-                }
-                else
-                    landblockUpdate = wo.UpdateObjectPhysics();
+                var landblockUpdate = wo.UpdateObjectPhysics();
 
                 if (landblockUpdate)
                     movedObjects.Add(wo);
             }
 
-            Monitor5m.PauseEvent();
-            Monitor1h.PauseEvent();
+            Monitor5m.Pause();
+            Monitor1h.Pause();
         }
 
         /// <summary>
-        /// Detects if player has moved through ForcedLocation or RequestedLocation
+        /// This will tick anything that can be multi-threaded safely using LandblockGroups as thread boundaries
+        /// This should be called after TickPhysics() and before Tick()
         /// </summary>
-        private static Position HandlePlayerPhysics(Player player)
-        {
-            Position newPosition = null;
-
-            if (player.ForcedLocation != null)
-                newPosition = player.ForcedLocation;
-            else if (player.RequestedLocation != null)
-                newPosition = player.RequestedLocation;
-
-            if (newPosition != null)
-                player.ClearRequestedPositions();
-
-            return newPosition;
-        }
-
-        public void Tick(double currentUnixTime)
+        public void TickMultiThreadedWork(double currentUnixTime)
         {
             if (monitorsRequireEventStart)
             {
-                Monitor5m.RegisterEventStart();
-                Monitor1h.RegisterEventStart();
+                Monitor5m.Restart();
+                Monitor1h.Restart();
             }
             else
             {
-                Monitor5m.ResumeEvent();
-                Monitor1h.ResumeEvent();
+                Monitor5m.Resume();
+                Monitor1h.Resume();
             }
 
-            ServerPerformanceMonitor.ResumeEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_RunActions);
+            stopwatch.Restart();
+            // This will consist of the following work:
+            // - this.CreateWorldObjects
+            // - this.SpawnDynamicShardObjects
+            // - this.SpawnEncounters
+            // - Adding items back onto the landblock from failed player movements: Player_Inventory.cs DoHandleActionPutItemInContainer()
+            // - Executing trade between two players: Player_Trade.cs FinalizeTrade()
             actionQueue.RunActions();
-            ServerPerformanceMonitor.PauseEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_RunActions);
+            ServerPerformanceMonitor.AddToCumulativeEvent(ServerPerformanceMonitor.CumulativeEventHistoryType.Landblock_Tick_RunActions, stopwatch.Elapsed.TotalSeconds);
 
             ProcessPendingWorldObjectAdditionsAndRemovals();
-
-            ServerPerformanceMonitor.ResumeEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_Player_Tick);
-            foreach (var player in players)
-                player.Player_Tick(currentUnixTime);
-            ServerPerformanceMonitor.PauseEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_Player_Tick);
 
             // When a WorldObject Ticks, it can end up adding additional WorldObjects to this landblock
             if (!IsDormant)
             {
-                ServerPerformanceMonitor.ResumeEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_Monster_Tick);
+                stopwatch.Restart();
                 while (sortedCreaturesByNextTick.Count > 0) // Monster_Tick()
                 {
                     var first = sortedCreaturesByNextTick.First.Value;
@@ -452,71 +440,11 @@ namespace ACE.Server.Entity
                         break;
                     }
                 }
-                ServerPerformanceMonitor.PauseEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_Monster_Tick);
+                ServerPerformanceMonitor.AddToCumulativeEvent(ServerPerformanceMonitor.CumulativeEventHistoryType.Landblock_Tick_Monster_Tick, stopwatch.Elapsed.TotalSeconds);
             }
-
-            ServerPerformanceMonitor.ResumeEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_WorldObject_Heartbeat);
-            while (sortedWorldObjectsByNextHeartbeat.Count > 0) // Heartbeat()
-            {
-                var first = sortedWorldObjectsByNextHeartbeat.First.Value;
-
-                // If they wanted to run before or at now
-                if (first.NextHeartbeatTime <= currentUnixTime)
-                {
-                    sortedWorldObjectsByNextHeartbeat.RemoveFirst();
-                    first.Heartbeat(currentUnixTime);
-                    InsertWorldObjectIntoSortedHeartbeatList(first); // WorldObjects can have heartbeats at different intervals
-                }
-                else
-                {
-                    break;
-                }
-            }
-            ServerPerformanceMonitor.PauseEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_WorldObject_Heartbeat);
-
-            ServerPerformanceMonitor.ResumeEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_GeneratorUpdate);
-            while (sortedGeneratorsByNextGeneratorUpdate.Count > 0)
-            {
-                var first = sortedGeneratorsByNextGeneratorUpdate.First.Value;
-
-                // If they wanted to run before or at now
-                if (first.NextGeneratorUpdateTime <= currentUnixTime)
-                {
-                    sortedGeneratorsByNextGeneratorUpdate.RemoveFirst();
-                    first.GeneratorUpdate(currentUnixTime);
-                    //InsertWorldObjectIntoSortedGeneratorUpdateList(first);
-                    sortedGeneratorsByNextGeneratorUpdate.AddLast(first);
-                }
-                else
-                {
-                    break;
-                }
-            }
-            ServerPerformanceMonitor.PauseEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_GeneratorUpdate);
-
-            ServerPerformanceMonitor.ResumeEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_GeneratorRegeneration);
-            while (sortedGeneratorsByNextRegeneration.Count > 0) // GeneratorRegeneration()
-            {
-                var first = sortedGeneratorsByNextRegeneration.First.Value;
-
-                //Console.WriteLine($"{first.Name}.Landblock_Tick_GeneratorRegeneration({currentUnixTime})");
-
-                // If they wanted to run before or at now
-                if (first.NextGeneratorRegenerationTime <= currentUnixTime)
-                {
-                    sortedGeneratorsByNextRegeneration.RemoveFirst();
-                    first.GeneratorRegeneration(currentUnixTime);
-                    InsertWorldObjectIntoSortedGeneratorRegenerationList(first); // Generators can have regnerations at different intervals
-                }
-                else
-                {
-                    break;
-                }
-            }
-            ServerPerformanceMonitor.PauseEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_GeneratorRegeneration);
 
             // Heartbeat
-            ServerPerformanceMonitor.ResumeEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_Heartbeat);
+            stopwatch.Restart();
             if (lastHeartBeat + heartbeatInterval <= DateTime.UtcNow)
             {
                 var thisHeartBeat = DateTime.UtcNow;
@@ -537,17 +465,17 @@ namespace ACE.Server.Entity
                 {
                     if (lastActiveTime + dormantInterval < thisHeartBeat)
                         IsDormant = true;
-                    if (lastActiveTime + unloadInterval < thisHeartBeat)
+                    if (lastActiveTime + UnloadInterval < thisHeartBeat)
                         LandblockManager.AddToDestructionQueue(this);
                 }
 
                 //log.Info($"Landblock {Id.ToString()}.Tick({currentUnixTime}).Landblock_Tick_Heartbeat: thisHeartBeat: {thisHeartBeat.ToString()} | lastHeartBeat: {lastHeartBeat.ToString()} | worldObjects.Count: {worldObjects.Count()}");
                 lastHeartBeat = thisHeartBeat;
             }
-            ServerPerformanceMonitor.PauseEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_Heartbeat);
+            ServerPerformanceMonitor.AddToCumulativeEvent(ServerPerformanceMonitor.CumulativeEventHistoryType.Landblock_Tick_Heartbeat, stopwatch.Elapsed.TotalSeconds);
 
             // Database Save
-            ServerPerformanceMonitor.ResumeEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_Database_Save);
+            stopwatch.Restart();
             if (lastDatabaseSave + databaseSaveInterval <= DateTime.UtcNow)
             {
                 ProcessPendingWorldObjectAdditionsAndRemovals();
@@ -555,7 +483,95 @@ namespace ACE.Server.Entity
                 SaveDB();
                 lastDatabaseSave = DateTime.UtcNow;
             }
-            ServerPerformanceMonitor.PauseEvent(ServerPerformanceMonitor.MonitorType.Landblock_Tick_Database_Save);
+            ServerPerformanceMonitor.AddToCumulativeEvent(ServerPerformanceMonitor.CumulativeEventHistoryType.Landblock_Tick_Database_Save, stopwatch.Elapsed.TotalSeconds);
+
+            Monitor5m.Pause();
+            Monitor1h.Pause();
+        }
+
+        /// <summary>
+        /// This will tick everything that should be done single threaded on the main ACE World thread
+        /// This should be called after TickPhysics() and after Tick()
+        /// </summary>
+        public void TickSingleThreadedWork(double currentUnixTime)
+        {
+            if (monitorsRequireEventStart)
+            {
+                Monitor5m.Restart();
+                Monitor1h.Restart();
+            }
+            else
+            {
+                Monitor5m.Resume();
+                Monitor1h.Resume();
+            }
+
+            ProcessPendingWorldObjectAdditionsAndRemovals();
+
+            stopwatch.Restart();
+            foreach (var player in players)
+                player.Player_Tick(currentUnixTime);
+            ServerPerformanceMonitor.AddToCumulativeEvent(ServerPerformanceMonitor.CumulativeEventHistoryType.Landblock_Tick_Player_Tick, stopwatch.Elapsed.TotalSeconds);
+
+            stopwatch.Restart();
+            while (sortedWorldObjectsByNextHeartbeat.Count > 0) // Heartbeat()
+            {
+                var first = sortedWorldObjectsByNextHeartbeat.First.Value;
+
+                // If they wanted to run before or at now
+                if (first.NextHeartbeatTime <= currentUnixTime)
+                {
+                    sortedWorldObjectsByNextHeartbeat.RemoveFirst();
+                    first.Heartbeat(currentUnixTime);
+                    InsertWorldObjectIntoSortedHeartbeatList(first); // WorldObjects can have heartbeats at different intervals
+                }
+                else
+                {
+                    break;
+                }
+            }
+            ServerPerformanceMonitor.AddToCumulativeEvent(ServerPerformanceMonitor.CumulativeEventHistoryType.Landblock_Tick_WorldObject_Heartbeat, stopwatch.Elapsed.TotalSeconds);
+
+            stopwatch.Restart();
+            while (sortedGeneratorsByNextGeneratorUpdate.Count > 0)
+            {
+                var first = sortedGeneratorsByNextGeneratorUpdate.First.Value;
+
+                // If they wanted to run before or at now
+                if (first.NextGeneratorUpdateTime <= currentUnixTime)
+                {
+                    sortedGeneratorsByNextGeneratorUpdate.RemoveFirst();
+                    first.GeneratorUpdate(currentUnixTime);
+                    //InsertWorldObjectIntoSortedGeneratorUpdateList(first);
+                    sortedGeneratorsByNextGeneratorUpdate.AddLast(first);
+                }
+                else
+                {
+                    break;
+                }
+            }
+            ServerPerformanceMonitor.AddToCumulativeEvent(ServerPerformanceMonitor.CumulativeEventHistoryType.Landblock_Tick_GeneratorUpdate, stopwatch.Elapsed.TotalSeconds);
+
+            stopwatch.Restart();
+            while (sortedGeneratorsByNextRegeneration.Count > 0) // GeneratorRegeneration()
+            {
+                var first = sortedGeneratorsByNextRegeneration.First.Value;
+
+                //Console.WriteLine($"{first.Name}.Landblock_Tick_GeneratorRegeneration({currentUnixTime})");
+
+                // If they wanted to run before or at now
+                if (first.NextGeneratorRegenerationTime <= currentUnixTime)
+                {
+                    sortedGeneratorsByNextRegeneration.RemoveFirst();
+                    first.GeneratorRegeneration(currentUnixTime);
+                    InsertWorldObjectIntoSortedGeneratorRegenerationList(first); // Generators can have regnerations at different intervals
+                }
+                else
+                {
+                    break;
+                }
+            }
+            ServerPerformanceMonitor.AddToCumulativeEvent(ServerPerformanceMonitor.CumulativeEventHistoryType.Landblock_Tick_GeneratorRegeneration, stopwatch.Elapsed.TotalSeconds);
 
             Monitor5m.RegisterEventEnd();
             Monitor1h.RegisterEventEnd();
@@ -757,6 +773,8 @@ namespace ACE.Server.Entity
 
             if (wo.PhysicsObj == null)
                 wo.InitPhysicsObj();
+            else
+                wo.PhysicsObj.set_object_guid(wo.Guid);  // re-add to ServerObjectManager
 
             if (wo.PhysicsObj.CurCell == null)
             {
@@ -766,10 +784,13 @@ namespace ACE.Server.Entity
                     wo.CurrentLandblock = null;
 
                     if (wo.Generator != null)
-                        log.Debug($"AddWorldObjectInternal: couldn't spawn 0x{wo.Guid}:{wo.Name} from generator {wo.Generator.WeenieClassId} - 0x{wo.Generator.Guid}:{wo.Generator.Name}");
+                    {
+                        log.Debug($"AddWorldObjectInternal: couldn't spawn 0x{wo.Guid}:{wo.Name} [{wo.WeenieClassId} - {wo.WeenieType}] from generator {wo.Generator.WeenieClassId} - 0x{wo.Generator.Guid}:{wo.Generator.Name}");
+                        wo.NotifyOfEvent(RegenerationType.PickUp); // Notify generator the generated object is effectively destroyed, use Pickup to catch both cases.
+                    }
 
                     else if (wo.ProjectileTarget == null)
-                        log.Warn($"AddWorldObjectInternal: couldn't spawn 0x{wo.Guid}:{wo.Name}");
+                        log.Warn($"AddWorldObjectInternal: couldn't spawn 0x{wo.Guid}:{wo.Name} [{wo.WeenieClassId} - {wo.WeenieType}]");
 
                     return false;
                 }
@@ -885,7 +906,7 @@ namespace ACE.Server.Entity
         /// <summary>
         /// This will return null if the object was not found in the current or adjacent landblocks.
         /// </summary>
-        public WorldObject GetObject(ObjectGuid guid)
+        public WorldObject GetObject(ObjectGuid guid, bool searchAdjacents = true)
         {
             if (pendingRemovals.Contains(guid))
                 return null;
@@ -893,10 +914,18 @@ namespace ACE.Server.Entity
             if (worldObjects.TryGetValue(guid, out var worldObject) || pendingAdditions.TryGetValue(guid, out worldObject))
                 return worldObject;
 
-            foreach (Landblock lb in Adjacents)
+            if (searchAdjacents)
             {
-                if (lb != null && !lb.pendingRemovals.Contains(guid) && (lb.worldObjects.TryGetValue(guid, out worldObject) || lb.pendingAdditions.TryGetValue(guid, out worldObject)))
-                    return worldObject;
+                foreach (Landblock lb in Adjacents)
+                {
+                    if (lb != null)
+                    {
+                        var wo = lb.GetObject(guid, false);
+
+                        if (wo != null)
+                            return wo;
+                    }
+                }
             }
 
             return null;
@@ -950,7 +979,7 @@ namespace ACE.Server.Entity
             lastActiveTime = DateTime.UtcNow;
             IsDormant = false;
 
-            if (isAdjacent || _landblock == null || _landblock.IsDungeon) return;
+            if (isAdjacent || PhysicsLandblock == null || PhysicsLandblock.IsDungeon) return;
 
             // for outdoor landblocks, recursively call 1 iteration to set adjacents to active
             foreach (var landblock in Adjacents)
@@ -991,6 +1020,26 @@ namespace ACE.Server.Entity
             LScape.unload_landblock(landblockID);
         }
 
+        public void DestroyAllNonPlayerObjects()
+        {
+            ProcessPendingWorldObjectAdditionsAndRemovals();
+
+            SaveDB();
+
+            // remove all objects
+            foreach (var wo in worldObjects.Where(i => !(i.Value is Player)).ToList())
+            {
+                if (!wo.Value.BiotaOriginatedFromOrHasBeenSavedToDatabase())
+                    wo.Value.Destroy(false);
+                else
+                    RemoveWorldObjectInternal(wo.Key);
+            }
+
+            ProcessPendingWorldObjectAdditionsAndRemovals();
+
+            actionQueue.Clear();
+        }
+
         private void SaveDB()
         {
             var biotas = new Collection<(Biota biota, ReaderWriterLockSlim rwLock)>();
@@ -1024,7 +1073,7 @@ namespace ACE.Server.Entity
         /// This is a rarely used method to broadcast network messages to all of the players within a landblock,
         /// and possibly the adjacent landblocks.
         /// </summary>
-        public void EnqueueBroadcast(ICollection<Player> excludeList, bool adjacents, params GameMessage[] msgs)
+        public void EnqueueBroadcast(ICollection<Player> excludeList, bool adjacents, Position pos = null, float? maxRangeSq = null, params GameMessage[] msgs)
         {
             var players = worldObjects.Values.OfType<Player>();
 
@@ -1035,20 +1084,29 @@ namespace ACE.Server.Entity
 
             // broadcast messages to player in this landblock
             foreach (var player in players)
+            {
+                if (pos != null && maxRangeSq != null)
+                {
+                    var distSq = player.Location.SquaredDistanceTo(pos);
+                    if (distSq > maxRangeSq)
+                        continue;
+                }
                 player.Session.Network.EnqueueSend(msgs);
+            }
 
             // if applicable, iterate into adjacent landblocks
             if (adjacents)
             {
                 foreach (var adjacent in this.Adjacents.Where(adj => adj != null))
-                    adjacent.EnqueueBroadcast(excludeList, false, msgs);
+                    adjacent.EnqueueBroadcast(excludeList, false, pos, maxRangeSq, msgs);
             }
         }
 
         private bool? isDungeon;
 
         /// <summary>
-        /// Returns TRUE if this landblock is a dungeon
+        /// Returns TRUE if this landblock is a dungeon,
+        /// with no traversable overworld
         /// </summary>
         public bool IsDungeon
         {
@@ -1075,21 +1133,30 @@ namespace ACE.Server.Entity
             }
         }
 
-        private bool? isHouseDungeon;
+        private bool? hasDungeon;
 
-        public bool IsHouseDungeon
+        /// <summary>
+        /// Returns TRUE if this landblock contains a dungeon
+        //
+        /// If a landblock contains both a dungeon + traversable overworld,
+        /// this field will return TRUE, whereas IsDungeon will return FALSE
+        /// 
+        /// This property should only be used in very specific scenarios,
+        /// such as determining if a landblock contains a mansion basement
+        /// </summary>
+        public bool HasDungeon
         {
             get
             {
                 // return cached value
-                if (isHouseDungeon != null)
-                    return isHouseDungeon.Value;
+                if (hasDungeon != null)
+                    return hasDungeon.Value;
 
-                isHouseDungeon = IsDungeon ? DatabaseManager.World.GetCachedHousePortalsByLandblock(Id.Landblock).Count > 0 : false;
-
-                return isHouseDungeon.Value;
+                hasDungeon = LandblockInfo != null && LandblockInfo.NumCells > 0 && LandblockInfo.Buildings != null && LandblockInfo.Buildings.Count == 0;
+                return hasDungeon.Value;
             }
         }
+
 
         public List<House> Houses = new List<House>();
 

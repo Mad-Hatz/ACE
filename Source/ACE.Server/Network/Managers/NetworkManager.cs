@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Threading;
+using System.Threading.Tasks;
 
 using log4net;
 
@@ -45,7 +46,7 @@ namespace ACE.Server.Network.Managers
         {
             if (connectionListener.ListenerEndpoint.Port == ConfigManager.Config.Server.Network.Port + 1)
             {
-                ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.ProcessPacket_1);
+                ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.ProcessPacket_1);
                 if (packet.Header.Flags.HasFlag(PacketHeaderFlags.ConnectResponse))
                 {
                     packetLog.Debug($"{packet}, {endPoint}");
@@ -90,7 +91,7 @@ namespace ACE.Server.Network.Managers
             }
             else // ConfigManager.Config.Server.Network.Port + 0
             {
-                ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.ProcessPacket_0);
+                ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.ProcessPacket_0);
                 if (packet.Header.HasFlag(PacketHeaderFlags.LoginRequest))
                 {
                     packetLog.Debug($"{packet}, {endPoint}");
@@ -107,22 +108,31 @@ namespace ACE.Server.Network.Managers
                     else
                     {
                         log.DebugFormat("Login Request from {0}", endPoint);
-                        var session = FindOrCreateSession(connectionListener, endPoint);
-                        if (session != null)
-                        {
-                            if (session.State == SessionState.AuthConnectResponse)
-                            {
-                                // connect request packet sent to the client was corrupted in transit and session entered an unspecified state.
-                                // ignore the request and remove the broken session and the client will start a new session.
-                                RemoveSession(session);
-                                log.Warn($"Bad handshake from {endPoint}, aborting session.");
-                            }
 
-                            session.ProcessPacket(packet);
+                        if (ConfigManager.Config.Server.Network.MaximumAllowedSessionsPerIPAddress == -1 || GetSessionEndpointTotalByAddressCount(endPoint.Address) < ConfigManager.Config.Server.Network.MaximumAllowedSessionsPerIPAddress)
+                        {
+                            var session = FindOrCreateSession(connectionListener, endPoint);
+                            if (session != null)
+                            {
+                                if (session.State == SessionState.AuthConnectResponse)
+                                {
+                                    // connect request packet sent to the client was corrupted in transit and session entered an unspecified state.
+                                    // ignore the request and remove the broken session and the client will start a new session.
+                                    RemoveSession(session);
+                                    log.Warn($"Bad handshake from {endPoint}, aborting session.");
+                                }
+
+                                session.ProcessPacket(packet);
+                            }
+                            else
+                            {
+                                log.InfoFormat("Login Request from {0} rejected. Failed to find or create session.", endPoint);
+                                SendLoginRequestReject(connectionListener, endPoint, CharacterError.LogonServerFull);
+                            }
                         }
                         else
                         {
-                            log.InfoFormat("Login Request from {0} rejected. Failed to find or create session.", endPoint);
+                            log.InfoFormat("Login Request from {0} rejected. Session would exceed MaximumAllowedSessionsPerIPAddress limit.", endPoint);
                             SendLoginRequestReject(connectionListener, endPoint, CharacterError.LogonServerFull);
                         }
                     }
@@ -202,6 +212,27 @@ namespace ACE.Server.Network.Managers
                 }
 
                 return ipAddresses.Count;
+            }
+            finally
+            {
+                sessionLock.ExitReadLock();
+            }
+        }
+
+        public static int GetSessionEndpointTotalByAddressCount(IPAddress address)
+        {
+            sessionLock.EnterReadLock();
+            try
+            {
+                int result = 0;
+
+                foreach (var s in sessionMap)
+                {
+                    if (s != null && s.EndPoint.Address.Equals(address))
+                        result++;
+                }
+
+                return result;
             }
             finally
             {
@@ -304,13 +335,12 @@ namespace ACE.Server.Network.Managers
             try
             {
                 // The session tick outbound processes pending actions and handles outgoing messages
-                ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.DoSessionWork_TickOutbound);
-                foreach (var s in sessionMap)
-                    s?.TickOutbound();
+                ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.DoSessionWork_TickOutbound);
+                Parallel.ForEach(sessionMap, ConfigManager.Config.Server.Threading.NetworkManagerParallelOptions, s => s?.TickOutbound());
                 ServerPerformanceMonitor.RegisterEventEnd(ServerPerformanceMonitor.MonitorType.DoSessionWork_TickOutbound);
 
                 // Removes sessions in the NetworkTimeout state, including sessions that have reached a timeout limit.
-                ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.DoSessionWork_RemoveSessions);
+                ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.DoSessionWork_RemoveSessions);
                 foreach (var session in sessionMap.Where(k => !Equals(null, k)))
                 {
                     if (session.PendingTermination != null && session.PendingTermination.TerminationStatus == SessionTerminationPhase.SessionWorkCompleted)

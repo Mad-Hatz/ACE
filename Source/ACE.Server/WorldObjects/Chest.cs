@@ -43,7 +43,7 @@ namespace ACE.Server.WorldObjects
             }
         }
 
-        public double Default_ChestResetInterval = 120;
+        public virtual double Default_ChestResetInterval => 120;
 
         /// <summary>
         /// A new biota be created taking all of its values from weenie.
@@ -155,7 +155,7 @@ namespace ACE.Server.WorldObjects
         {
             base.Open(player);
 
-            if (!ResetMessagePending)
+            if (!ResetMessagePending && !double.IsPositiveInfinity(ChestResetInterval))
             {
                 var actionChain = new ActionChain();
                 actionChain.AddDelaySeconds(ChestResetInterval);
@@ -283,9 +283,9 @@ namespace ACE.Server.WorldObjects
         /// <summary>
         /// Used for unlocking a chest via a key
         /// </summary>
-        public UnlockResults Unlock(uint unlockerGuid, string keyCode)
+        public UnlockResults Unlock(uint unlockerGuid, Key key, string keyCode = null)
         {
-            var result = LockHelper.Unlock(this, keyCode);
+            var result = LockHelper.Unlock(this, key, keyCode);
 
             if (result == UnlockResults.UnlockSuccess)
                 LastUnlocker = unlockerGuid;

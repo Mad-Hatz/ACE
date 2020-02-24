@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+using ACE.Common;
 using ACE.Database;
 using ACE.Database.Models.Shard;
 using ACE.Database.Models.World;
@@ -262,7 +263,7 @@ namespace ACE.Server.WorldObjects
                 EnqueueBroadcast(false, new GameMessageSound(Guid, Sound.WieldObject));
 
             if (worldObject.ParentLocation != null)
-                EnqueueBroadcast(new GameMessageParentEvent(this, worldObject, (int?)worldObject.ParentLocation ?? 0, (int?)worldObject.Placement ?? 0));
+                EnqueueBroadcast(new GameMessageParentEvent(this, worldObject));
 
             EnqueueBroadcast(new GameMessageObjDescEvent(this));
 
@@ -277,7 +278,7 @@ namespace ACE.Server.WorldObjects
         /// It does not add it to inventory as you could be unwielding to the ground or a chest.<para />
         /// It will also decrease the EncumbranceVal and Value.
         /// </summary>
-        private bool TryDequipObject(ObjectGuid objectGuid, out WorldObject worldObject, out int wieldedLocation)
+        public bool TryDequipObject(ObjectGuid objectGuid, out WorldObject worldObject, out int wieldedLocation)
         {
             if (!EquippedObjects.Remove(objectGuid, out worldObject))
             {
@@ -336,6 +337,18 @@ namespace ACE.Server.WorldObjects
                 EnqueueBroadcast(false, new GameMessageSound(Guid, Sound.UnwieldObject));
 
             EnqueueBroadcast(new GameMessageObjDescEvent(this));
+
+            // If item has any spells, remove them from the registry on unequip
+            if (worldObject.Biota.BiotaPropertiesSpellBook != null)
+            {
+                foreach (var spell in worldObject.Biota.BiotaPropertiesSpellBook)
+                {
+                    if (worldObject.HasProcSpell((uint)spell.Spell))
+                        continue;
+
+                    RemoveItemSpell(worldObject, (uint)spell.Spell, true);
+                }
+            }
 
             if (!droppingToLandscape)
             {
@@ -419,7 +432,7 @@ namespace ACE.Server.WorldObjects
                     }
                     else
                     {
-                        placement = ACE.Entity.Enum.Placement.RightHandCombat;
+                        placement = ACE.Entity.Enum.Placement.RightHandNonCombat;
                         parentLocation = ACE.Entity.Enum.ParentLocation.LeftWeapon;
                     }
                     break;

@@ -132,13 +132,19 @@ namespace ACE.Server.WorldObjects
                 var item = GetInventoryItem(itemGuid);
                 if (item == null)
                 {
-                    log.Warn($"{Name}.HandleSalvaging({itemGuid:X8}): couldn't find inventory item");
+                    log.Debug($"[CRAFTING] {Name}.HandleSalvaging({itemGuid:X8}): couldn't find inventory item");
                     continue;
                 }
 
                 if (item.MaterialType == null)
                 {
                     log.Warn($"{Name}.HandleSalvaging({item.Name}): no material type");
+                    continue;
+                }
+
+                if (IsTrading && ItemsInTradeWindow.Contains(item.Guid))
+                {
+                    SendWeenieError(WeenieError.YouCannotSalvageItemsInTrading);
                     continue;
                 }
 

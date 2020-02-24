@@ -67,7 +67,7 @@ namespace ACE.Server.WorldObjects
                 var dtTimeToRot = DateTime.UtcNow.AddSeconds(TimeToRot ?? 0);
                 var tsDecay = dtTimeToRot - DateTime.UtcNow;
 
-                log.Info($"{Name} (0x{Guid.ToString()}) Reloaded from Database: Corpse Level: {Level ?? 0} | InventoryLoaded: {InventoryLoaded} | Inventory.Count: {Inventory.Count} | TimeToRot: {TimeToRot} | CreationTimestamp: {CreationTimestamp} ({Time.GetDateTimeFromTimestamp(CreationTimestamp ?? 0).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")}) | Corpse should not decay before: {dtTimeToRot.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")}, {tsDecay.ToString("%d")} day(s), {tsDecay.ToString("%h")} hours, {tsDecay.ToString("%m")} minutes, and {tsDecay.ToString("%s")} seconds from now.");
+                log.Debug($"[CORPSE] {Name} (0x{Guid}) Reloaded from Database: Corpse Level: {Level ?? 0} | InventoryLoaded: {InventoryLoaded} | Inventory.Count: {Inventory.Count} | TimeToRot: {TimeToRot} | CreationTimestamp: {CreationTimestamp} ({Time.GetDateTimeFromTimestamp(CreationTimestamp ?? 0).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")}) | Corpse should not decay before: {dtTimeToRot.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")}, {tsDecay.ToString("%d")} day(s), {tsDecay.ToString("%h")} hours, {tsDecay.ToString("%m")} minutes, and {tsDecay.ToString("%s")} seconds from now.");
             }
         }
 
@@ -114,7 +114,7 @@ namespace ACE.Server.WorldObjects
 
             Level = player.Level ?? 1;
 
-            log.Info($"{Name}.RecalculateDecayTime({player.Name}): Player Level: {player.Level} | Inventory.Count: {Inventory.Count} | TimeToRot: {TimeToRot} | CreationTimestamp: {CreationTimestamp} ({Time.GetDateTimeFromTimestamp(CreationTimestamp ?? 0).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")}) | Corpse should not decay before: {dtTimeToRot.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")}, {tsDecay.ToString("%d")} day(s), {tsDecay.ToString("%h")} hours, {tsDecay.ToString("%m")} minutes, and {tsDecay.ToString("%s")} seconds from now.");
+            log.Debug($"[CORPSE] {Name}.RecalculateDecayTime({player.Name}) 0x{Guid}: Player Level: {player.Level} | Inventory.Count: {Inventory.Count} | TimeToRot: {TimeToRot} | CreationTimestamp: {CreationTimestamp} ({Time.GetDateTimeFromTimestamp(CreationTimestamp ?? 0).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")}) | Corpse should not decay before: {dtTimeToRot.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")}, {tsDecay.ToString("%d")} day(s), {tsDecay.ToString("%h")} hours, {tsDecay.ToString("%m")} minutes, and {tsDecay.ToString("%s")} seconds from now.");
         }
 
         /// <summary>
@@ -184,25 +184,31 @@ namespace ACE.Server.WorldObjects
             set { if (!value) RemoveProperty(PropertyBool.CorpseGeneratedRare); else SetProperty(PropertyBool.CorpseGeneratedRare, value); }
         }
 
-        public override void EnterWorld()
+        public bool IsOnNoDropLandblock => Location != null ? NoDrop_Landblocks.Contains(Location.LandblockId.Landblock) : false;
+
+        public override bool EnterWorld()
         {
             var actionChain = new ActionChain();
 
-            base.EnterWorld();
+            var success = base.EnterWorld();
+            if (!success)
+            {
+                log.Error($"{Name} ({Guid}) failed to spawn @ {Location?.ToLOCString()}");
+                return false;
+            }
 
-            actionChain.AddDelaySeconds(.5);
+            actionChain.AddDelaySeconds(0.5f);
             actionChain.AddAction(this, () =>
             {
-                if (Location != null)
+                if (Location != null && CorpseGeneratedRare)
                 {
-                    if (CorpseGeneratedRare)
-                    {
-                        EnqueueBroadcast(new GameMessageSystemChat($"{killerName} has discovered the {rareGenerated.Name}!", ChatMessageType.System));
-                        ApplySoundEffects(Sound.TriggerActivated, 10);
-                    }
+                    EnqueueBroadcast(new GameMessageSystemChat($"{killerName} has discovered the {rareGenerated.Name}!", ChatMessageType.System));
+                    ApplySoundEffects(Sound.TriggerActivated, 10);
                 }
             });
             actionChain.EnqueueChain();
+
+            return true;
         }
 
         private WorldObject rareGenerated;
@@ -211,7 +217,7 @@ namespace ACE.Server.WorldObjects
         /// <summary>
         /// Called to generate rare and add to corpse inventory
         /// </summary>
-        public void GenerateRare(WorldObject killer)
+        public void GenerateRare(DamageHistoryInfo killer)
         {
             //todo: calculate chances for killer's luck (rare timers)
 
@@ -225,8 +231,8 @@ namespace ACE.Server.WorldObjects
             var tier = LootGenerationFactory.GetRareTier(wo.WeenieClassId);
             LootGenerationFactory.RareChances.TryGetValue(tier, out var chance);
 
-            log.Info($"[RARE] {Name} ({Guid}) generated rare {wo.Name} ({wo.Guid}) for {killer.Name} ({killer.Guid})");
-            log.Info($"[RARE] Tier {tier} -- 1 / {chance:N0} chance");
+            log.Debug($"[LOOT][RARE] {Name} ({Guid}) generated rare {wo.Name} ({wo.Guid}) for {killer.Name} ({killer.Guid})");
+            log.Debug($"[LOOT][RARE] Tier {tier} -- 1 / {chance:N0} chance");
 
             if (TryAddToInventory(wo))
             {
@@ -238,5 +244,29 @@ namespace ACE.Server.WorldObjects
             else
                 log.Error($"[RARE] failed to add to corpse inventory");
         }
+
+        /// <summary>
+        /// A list of landblocks the player cannot drop items on corpse on death 
+        /// </summary>
+        public static HashSet<ushort> NoDrop_Landblocks = new HashSet<ushort>()
+        {
+            0x005F,     // Tanada House of Pancakes (Seasonal)
+            0x00AF,     // Colosseum Staging Area and Secret Mini-Bosses
+            0x00B0,     // Colosseum Arena One
+            0x00B1,     // Colosseum Arena Two
+            0x00B2,     // Colosseum Arena Three
+            0x00B3,     // Colosseum Arena Four
+            0x00B4,     // Colosseum Arena Five
+            0x00B6,     // Colosseum Arena Mini-Bosses
+            0x5960,     // Gauntlet Arena One (Celestial Hand)
+            0x5961,     // Gauntlet Arena Two (Celestial Hand)
+            0x5962,     // Gauntlet Arena One (Eldritch Web)
+            0x5963,     // Gauntlet Arena Two (Eldritch Web)
+            0x5964,     // Gauntlet Arena One (Radiant Blood)
+            0x5965,     // Gauntlet Arena Two (Radiant Blood)
+            0x596B,     // Gauntlet Staging Area (All Societies)
+            0x8A04,     // Night Club (Seasonal Anniversary)
+            0xB5F0,     // Aerfalle's Sanctum
+        };
     }
 }

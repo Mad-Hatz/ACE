@@ -10,6 +10,7 @@ using ACE.Entity.Enum;
 using ACE.Entity.Enum.Properties;
 using ACE.Database.Models.Shard;
 using ACE.Server.Entity;
+using ACE.Server.Managers;
 using ACE.Server.WorldObjects.Entity;
 
 using Position = ACE.Entity.Position;
@@ -21,6 +22,24 @@ namespace ACE.Server.WorldObjects
         private static readonly ILog log = LogManager.GetLogger(System.Reflection.MethodBase.GetCurrentMethod().DeclaringType);
 
         public bool IsExhausted { get => Stamina.Current == 0; }
+
+        protected QuestManager _questManager;
+
+        public QuestManager QuestManager
+        {
+            get
+            {
+                if (_questManager == null)
+                {
+                    if (!(this is Player))
+                        log.Debug($"Initializing non-player QuestManager for {Name} (0x{Guid})");   // verify this almost never happens
+
+                    _questManager = new QuestManager(this);
+                }
+
+                return _questManager;
+            }
+        }
 
         /// <summary>
         /// A new biota be created taking all of its values from weenie.
@@ -46,7 +65,7 @@ namespace ACE.Server.WorldObjects
             if (CreatureType == ACE.Entity.Enum.CreatureType.Human && !(WeenieClassId == 1 || WeenieClassId == 4))
                 GenerateNewFace();
 
-            if (CreatureType == ACE.Entity.Enum.CreatureType.Shadow || CreatureType == ACE.Entity.Enum.CreatureType.Simulacrum)
+            if (CreatureType == ACE.Entity.Enum.CreatureType.Empyrean || CreatureType == ACE.Entity.Enum.CreatureType.Shadow || CreatureType == ACE.Entity.Enum.CreatureType.Simulacrum)
                 GenerateNewFace();
 
             // If any of the vitals don't exist for this biota, one will be created automatically in the CreatureVital ctor
@@ -74,11 +93,11 @@ namespace ACE.Server.WorldObjects
 
             if (!(this is Player))
             {
+                GenerateWieldList();
+
                 if (!(this is CombatPet)) //combat pets normally wouldn't have these items, but due to subbing in code currently, sometimes they do. this skips them for now.
                 {
-                    GenerateWieldList();
                     GenerateWieldedTreasure();
-
 
                     EquipInventoryItems();
                 }
@@ -119,7 +138,19 @@ namespace ACE.Server.WorldObjects
             }
 
             if (!Heritage.HasValue || !Gender.HasValue)
+            {
+#if DEBUG
+                if (!(NpcLooksLikeObject ?? false))
+                    log.Debug($"Creature.GenerateNewFace: {Name} (0x{Guid}) - wcid {WeenieClassId} - Heritage: {Heritage} | HeritageGroupName: {HeritageGroupName} | Gender: {Gender} | Sex: {Sex} - Data missing or unparsable, Cannot randomize face.");
+#endif
                 return;
+            }
+
+            if (!cg.HeritageGroups.ContainsKey((uint)Heritage) || !cg.HeritageGroups[(uint)Heritage].Genders.ContainsKey((int)Gender))
+            {
+                log.Debug($"Creature.GenerateNewFace: {Name} (0x{Guid}) - wcid {WeenieClassId} - Heritage: {Heritage} | HeritageGroupName: {HeritageGroupName} | Gender: {Gender} | Sex: {Sex} - Data invalid, Cannot randomize face.");
+                return;
+            }
 
             SexCG sex = cg.HeritageGroups[(uint)Heritage].Genders[(int)Gender];
 
@@ -211,12 +242,16 @@ namespace ACE.Server.WorldObjects
         /// <summary>
         /// Sends the network commands to move a player towards an object
         /// </summary>
-        public void MoveToObject(WorldObject target, float? useRadius)
+        public void MoveToObject(WorldObject target, float? useRadius = null)
         {
             var distanceToObject = useRadius ?? target.UseRadius ?? 0.6f;
 
             var moveToObject = new Motion(this, target, MovementType.MoveToObject);
             moveToObject.MoveToParameters.DistanceToObject = distanceToObject;
+
+            // move directly to portal origin
+            //if (target is Portal)
+                //moveToObject.MoveToParameters.MovementParameters &= ~MovementParams.UseSpheres;
 
             SetWalkRunThreshold(moveToObject, target.Location);
 
@@ -277,6 +312,8 @@ namespace ACE.Server.WorldObjects
 
             if (target is Door door)
                 door.OnCollideObject(this);
+            else if (target is Hotspot hotspot)
+                hotspot.OnCollideObject(this);
         }
     }
 }

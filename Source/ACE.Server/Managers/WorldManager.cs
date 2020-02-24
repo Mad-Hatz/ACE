@@ -6,6 +6,7 @@ using System.Threading;
 using log4net;
 
 using ACE.Common;
+using ACE.Common.Performance;
 using ACE.Database;
 using ACE.Database.Entity;
 using ACE.Database.Models.Shard;
@@ -58,6 +59,7 @@ namespace ACE.Server.Managers
                 UpdateWorld();
             });
             thread.Name = "World Manager";
+            thread.Priority = ThreadPriority.AboveNormal;
             thread.Start();
             log.DebugFormat("ServerTime initialized to {0}", Timers.WorldStartLoreTime);
             log.DebugFormat($"Current maximum allowed sessions: {ConfigManager.Config.Server.Network.MaximumAllowedSessions}");
@@ -66,7 +68,7 @@ namespace ACE.Server.Managers
             if (WorldStatus == WorldStatusState.Closed)
                 log.Info($"To open world to players, use command: world open");
         }
- 
+
         internal static void Open(Player player)
         {
             WorldStatus = WorldStatusState.Open;
@@ -79,7 +81,7 @@ namespace ACE.Server.Managers
             var msg = "World is now closed";
             if (bootPlayers)
                 msg += ", and booting all online players.";
-            
+
             PlayerManager.BroadcastToAuditChannel(player, msg);
 
             if (bootPlayers)
@@ -262,6 +264,24 @@ namespace ACE.Server.Managers
             return Regex.Replace(result, "\n$", "");
         }
 
+        /// <summary>
+        /// ACE allows for multi-threading with thread boundaries based on the "LandblockGroup" concept
+        /// The risk of moving the player immediately is that the player may move onto another LandblockGroup, and thus, cross thread boundaries
+        /// This will enqueue the work onto WorldManager making the teleport thread safe.
+        /// Note that this work will be done on the next tick, not immediately, so be careful about your order of operations.
+        /// If you must ensure order, pass your follow up work in with the argument actionToFollowUpWith. That work will be enqueued onto the Player.
+        /// </summary>
+        public static void ThreadSafeTeleport(Player player, Position newPosition, IAction actionToFollowUpWith = null)
+        {
+            EnqueueAction(new ActionEventDelegate(() =>
+            {
+                player.Teleport(newPosition);
+
+                if (actionToFollowUpWith != null)
+                    EnqueueAction(actionToFollowUpWith);
+            }));
+        }
+
         public static void EnqueueAction(IAction action)
         {
             actionQueue.EnqueueAction(action);
@@ -308,34 +328,32 @@ namespace ACE.Server.Managers
                  * The only cases where it's acceptable for to create a new Task, Thread or Parallel loop are the following:
                    - Every scenario must be one where you don't care about breaking ACE
                    - DeveloperCommand Handlers
-
-                 * TODO: We need a thread safe way to handle object transitions between distant landblocks
                 */
 
                 worldTickTimer.Restart();
 
-                ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.PlayerManager_Tick);
+                ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.PlayerManager_Tick);
                 PlayerManager.Tick();
                 ServerPerformanceMonitor.RegisterEventEnd(ServerPerformanceMonitor.MonitorType.PlayerManager_Tick);
 
-                ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.NetworkManager_InboundClientMessageQueueRun);
+                ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.NetworkManager_InboundClientMessageQueueRun);
                 NetworkManager.InboundMessageQueue.RunActions();
                 ServerPerformanceMonitor.RegisterEventEnd(ServerPerformanceMonitor.MonitorType.NetworkManager_InboundClientMessageQueueRun);
 
                 // This will consist of PlayerEnterWorld actions, as well as other game world actions that require thread safety
-                ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.actionQueue_RunActions);
+                ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.actionQueue_RunActions);
                 actionQueue.RunActions();
                 ServerPerformanceMonitor.RegisterEventEnd(ServerPerformanceMonitor.MonitorType.actionQueue_RunActions);
 
-                ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.DelayManager_RunActions);
+                ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.DelayManager_RunActions);
                 DelayManager.RunActions();
                 ServerPerformanceMonitor.RegisterEventEnd(ServerPerformanceMonitor.MonitorType.DelayManager_RunActions);
 
-                ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.UpdateGameWorld);
+                ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.UpdateGameWorld);
                 var gameWorldUpdated = UpdateGameWorld();
                 ServerPerformanceMonitor.RegisterEventEnd(ServerPerformanceMonitor.MonitorType.UpdateGameWorld);
 
-                ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.NetworkManager_DoSessionWork);
+                ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.NetworkManager_DoSessionWork);
                 int sessionCount = NetworkManager.DoSessionWork();
                 ServerPerformanceMonitor.RegisterEventEnd(ServerPerformanceMonitor.MonitorType.NetworkManager_DoSessionWork);
 
@@ -364,13 +382,15 @@ namespace ACE.Server.Managers
 
             updateGameWorldRateLimiter.RegisterEvent();
 
-            ServerPerformanceMonitor.RegisterEventStart(ServerPerformanceMonitor.MonitorType.UpdateGameWorld_Entire);
+            ServerPerformanceMonitor.RestartCumulativeEvents();
+            ServerPerformanceMonitor.RestartEvent(ServerPerformanceMonitor.MonitorType.UpdateGameWorld_Entire);
 
             LandblockManager.Tick(Timers.PortalYearTicks);
 
             HouseManager.Tick();
 
             ServerPerformanceMonitor.RegisterEventEnd(ServerPerformanceMonitor.MonitorType.UpdateGameWorld_Entire);
+            ServerPerformanceMonitor.RegisterCumulativeEvents();
 
             return true;
         }

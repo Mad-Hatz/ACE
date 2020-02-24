@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+
 using log4net;
 
+using ACE.Common;
 using ACE.Common.Extensions;
 using ACE.Database;
 using ACE.Database.Models.Shard;
@@ -81,18 +83,29 @@ namespace ACE.Server.Managers
             bool success = true; // assume success, unless there's a skill check
             double percentSuccess = 1;
 
+            var animTime = 0.0f;
+
             player.IsBusy = true;
 
             if (player.CombatMode != CombatMode.NonCombat)
             {
                 var stanceTime = player.SetCombatMode(CombatMode.NonCombat);
                 craftChain.AddDelaySeconds(stanceTime);
+
+                animTime += stanceTime;
             }
 
-            player.EnqueueMotion(craftChain, MotionCommand.ClapHands);
+            animTime += player.EnqueueMotion(craftChain, MotionCommand.ClapHands);
 
             craftChain.AddAction(player, () =>
             {
+                // re-verify
+                if (!VerifyRequirements(recipe, player, source, target))
+                {
+                    player.SendUseDoneEvent(WeenieError.YouDoNotPassCraftingRequirements);
+                    return;
+                }
+
                 if (recipe.Skill > 0 && recipe.Difficulty > 0)
                 {
                     // there's a skill associated with this
@@ -157,6 +170,8 @@ namespace ACE.Server.Managers
             player.EnqueueMotion(craftChain, MotionCommand.Ready);
 
             craftChain.EnqueueChain();
+
+            player.NextUseTime = DateTime.UtcNow.AddSeconds(animTime);
         }
 
         public static float DoMotion(Player player, MotionCommand motionCommand)
@@ -174,7 +189,7 @@ namespace ACE.Server.Managers
             double successChance;
             bool incItemTinkered = true;
 
-            Console.WriteLine($"{player.Name}.HandleTinkering({tool.Name}, {target.Name})");
+            Console.WriteLine($"{player.Name}.HandleTinkering({tool.NameWithMaterial}, {target.NameWithMaterial})");
 
             // calculate % success chance
 
@@ -266,6 +281,8 @@ namespace ACE.Server.Managers
             actionChain.AddAction(player, () => DoTinkering(player, tool, target, recipe, (float)successChance, incItemTinkered));
             actionChain.AddAction(player, () => DoMotion(player, MotionCommand.Ready));
             actionChain.EnqueueChain();
+
+            player.NextUseTime = DateTime.UtcNow.AddSeconds(animLength);
         }
 
         public static void DoTinkering(Player player, WorldObject tool, WorldObject target, Recipe recipe, float chance, bool incItemTinkered)
@@ -670,6 +687,9 @@ namespace ACE.Server.Managers
 
         public static bool VerifyRequirements(Recipe recipe, Player player, WorldObject source, WorldObject target)
         {
+            if (!VerifyUse(player, source, target))
+                return false;
+
             if (!VerifyRequirements(recipe, player, target, RequirementType.Target)) return false;
 
             if (!VerifyRequirements(recipe, player, source, RequirementType.Source)) return false;
@@ -677,6 +697,46 @@ namespace ACE.Server.Managers
             if (!VerifyRequirements(recipe, player, player, RequirementType.Player)) return false;
 
             return true;
+        }
+
+        public static bool VerifyUse(Player player, WorldObject source, WorldObject target)
+        {
+            var usable = source.Usable ?? Usable.Undef;
+
+            if (usable == Usable.Undef)
+            {
+                log.Warn($"{player.Name}.RecipeManager.VerifyUse({source.Name} ({source.Guid}), {target.Name} ({target.Guid})) - source not usable, falling back on defaults");
+
+                // re-verify
+                if (player.FindObject(source.Guid.Full, Player.SearchLocations.MyInventory) == null)
+                    return false;
+
+                // almost always MyInventory, but sometimes can be applied to equipped
+                if (player.FindObject(target.Guid.Full, Player.SearchLocations.MyInventory | Player.SearchLocations.MyEquippedItems) == null)
+                    return false;
+
+                return true;
+            }
+
+            var sourceUse = usable.GetSourceFlags();
+            var targetUse = usable.GetTargetFlags();
+
+            return VerifyUse(player, source, sourceUse) && VerifyUse(player, target, targetUse);
+        }
+
+        public static bool VerifyUse(Player player, WorldObject obj, Usable usable)
+        {
+            var searchLocations = Player.SearchLocations.None;
+
+            // TODO: figure out other Usable flags
+            if (usable.HasFlag(Usable.Contained))
+                searchLocations |= Player.SearchLocations.MyInventory;
+            if (usable.HasFlag(Usable.Wielded))
+                searchLocations |= Player.SearchLocations.MyEquippedItems;
+            if (usable.HasFlag(Usable.Remote))
+                searchLocations |= Player.SearchLocations.LocationsICanMove;    // TODO: moveto for this type
+
+            return player.FindObject(obj.Guid.Full, searchLocations) != null;
         }
 
         public static bool Debug = false;
@@ -874,6 +934,16 @@ namespace ACE.Server.Managers
             var destroyTarget = ThreadSafeRandom.Next(0.0f, 1.0f) <= destroyTargetChance;
             var destroySource = ThreadSafeRandom.Next(0.0f, 1.0f) <= destroySourceChance;
 
+            var createItem = success ? recipe.SuccessWCID : recipe.FailWCID;
+            var createAmount = success ? recipe.SuccessAmount : recipe.FailAmount;
+
+            if (createItem > 0 && DatabaseManager.World.GetWeenie(createItem) == null)
+            {
+                log.Error($"RecipeManager.CreateDestroyItems: Recipe.Id({recipe.Id}) couldn't find {(success ? "Success" : "Fail")}WCID {createItem} in database.");
+                player.Session.Network.EnqueueSend(new GameEventWeenieError(player.Session, WeenieError.CraftGeneralErrorUiMsg));
+                return;
+            }
+
             if (destroyTarget)
             {
                 var destroyTargetAmount = success ? recipe.SuccessDestroyTargetAmount : recipe.FailDestroyTargetAmount;
@@ -889,9 +959,6 @@ namespace ACE.Server.Managers
 
                 DestroyItem(player, recipe, source, destroySourceAmount, destroySourceMessage);
             }
-
-            var createItem = success ? recipe.SuccessWCID : recipe.FailWCID;
-            var createAmount = success ? recipe.SuccessAmount : recipe.FailAmount;
 
             WorldObject result = null;
 
@@ -995,6 +1062,15 @@ namespace ACE.Server.Managers
                     continue;
 
                 // apply base mod
+                switch (mod.DataId)
+                {
+                    // 	Fetish of the Dark Idols
+                    case 0x38000046:
+                        AddImbuedEffect(player, target, ImbuedEffectType.IgnoreSomeMagicProjectileDamage);
+                        target.SetProperty(PropertyFloat.AbsorbMagicDamage, 0.25f);
+                        break;
+                }
+
                 // adjust vitals, but all appear to be 0 in current database?
 
                 // apply type mods

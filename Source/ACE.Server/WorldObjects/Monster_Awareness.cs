@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Numerics;
 
+using ACE.Common;
 using ACE.Common.Extensions;
 using ACE.Entity.Enum;
 using ACE.Entity.Enum.Properties;
@@ -35,7 +37,7 @@ namespace ACE.Server.WorldObjects
             MonsterState = State.Awake;
             IsAwake = true;
             //DoAttackStance();
-            EmoteManager.OnAttack(AttackTarget as Creature);
+            EmoteManager.OnWakeUp(AttackTarget as Creature);
             //SelectTargetingTactic();
 
             if (alertNearby)
@@ -52,10 +54,14 @@ namespace ACE.Server.WorldObjects
 
             SetCombatMode(CombatMode.NonCombat);
 
+            CurrentAttack = null;
+            firstUpdate = true;
             AttackTarget = null;
             IsAwake = false;
             IsMoving = false;
             MonsterState = State.Idle;
+
+            PhysicsObj.CachedVelocity = Vector3.Zero;
         }
 
         public Tolerance Tolerance
@@ -130,7 +136,7 @@ namespace ACE.Server.WorldObjects
 
         public virtual bool FindNextTarget()
         {
-            ServerPerformanceMonitor.ResumeEvent(ServerPerformanceMonitor.MonitorType.Monster_Awareness_FindNextTarget);
+            stopwatch.Restart();
 
             try
             {
@@ -141,10 +147,8 @@ namespace ACE.Server.WorldObjects
                 if (visibleTargets.Count == 0)
                 {
                     if (MonsterState != State.Return)
-                    {
-                        AttackTarget = null;
                         MoveToHome();
-                    }
+
                     return false;
                 }
 
@@ -158,6 +162,8 @@ namespace ACE.Server.WorldObjects
 
                 // Players within the creature's detection sphere are weighted by how close they are to the creature --
                 // the closer you are, the more chance you have to be selected to be attacked.
+
+                var prevAttackTarget = AttackTarget;
 
                 switch (CurrentTargetingTactic)
                 {
@@ -180,14 +186,14 @@ namespace ACE.Server.WorldObjects
 
                     case TargetingTactic.LastDamager:
 
-                        var lastDamager = DamageHistory.LastDamager;
+                        var lastDamager = DamageHistory.LastDamager?.TryGetAttacker() as Creature;
                         if (lastDamager != null)
                             AttackTarget = lastDamager;
                         break;
 
                     case TargetingTactic.TopDamager:
 
-                        var topDamager = DamageHistory.TopDamager;
+                        var topDamager = DamageHistory.TopDamager?.TryGetAttacker() as Creature;
                         if (topDamager != null)
                             AttackTarget = topDamager;
                         break;
@@ -218,11 +224,14 @@ namespace ACE.Server.WorldObjects
 
                 //Console.WriteLine($"{Name}.FindNextTarget = {AttackTarget.Name}");
 
+                if (AttackTarget != null && AttackTarget != prevAttackTarget)
+                    EmoteManager.OnNewEnemy(AttackTarget);
+
                 return AttackTarget != null;
             }
             finally
             {
-                ServerPerformanceMonitor.PauseEvent(ServerPerformanceMonitor.MonitorType.Monster_Awareness_FindNextTarget);
+                ServerPerformanceMonitor.AddToCumulativeEvent(ServerPerformanceMonitor.CumulativeEventHistoryType.Monster_Awareness_FindNextTarget, stopwatch.Elapsed.TotalSeconds);
             }
         }
 
@@ -233,11 +242,8 @@ namespace ACE.Server.WorldObjects
         {
             var visibleTargets = new List<Creature>();
 
-            foreach (var target in PhysicsObj.ObjMaint.VisibleTargets.Values)
+            foreach (var creature in PhysicsObj.ObjMaint.GetVisibleTargetsValuesOfTypeCreature())
             {
-                var creature = target.WeenieObj.WorldObject as Creature;
-                if (creature == null) continue;
-
                 // ensure attackable
                 if (!creature.Attackable || creature.Teleporting) continue;
 
@@ -317,11 +323,9 @@ namespace ACE.Server.WorldObjects
             Creature closestTarget = null;
             var closestDistSq = float.MaxValue;
 
-            foreach (var visibleTarget in PhysicsObj.ObjMaint.VisibleTargets.Values)
+            foreach (var creature in PhysicsObj.ObjMaint.GetVisibleTargetsValuesOfTypeCreature())
             {
-                var creature = visibleTarget.WeenieObj.WorldObject as Creature;
-
-                if (creature == null || creature is Player player && (!player.Attackable || player.Teleporting || (player.Hidden ?? false)))
+                if (creature is Player player && (!player.Attackable || player.Teleporting || (player.Hidden ?? false)))
                     continue;
 
                 var distSq = Location.SquaredDistanceTo(creature.Location);

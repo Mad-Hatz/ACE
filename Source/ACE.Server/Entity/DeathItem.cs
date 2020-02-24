@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+
+using ACE.Common;
 using ACE.Entity.Enum;
 using ACE.Server.WorldObjects;
 
@@ -201,7 +203,7 @@ namespace ACE.Server.Entity
                     case ItemType.Container:
                         return DeathItemCategory.None;  // containers don't drop?
                     default:
-                        Console.WriteLine("Unknown death item type: " + wo.ItemType);
+                        //Console.WriteLine("Unknown death item type: " + wo.ItemType);
                         return DeathItemCategory.None;
                 }
             }

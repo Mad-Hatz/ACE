@@ -61,7 +61,7 @@ namespace ACE.Server.WorldObjects
 
         private void SetEphemeralValues()
         {
-            DefaultScriptId = (uint)ACE.Entity.Enum.PlayScript.RestrictionEffectBlue;
+            DefaultScriptId = (uint)PlayScript.RestrictionEffectBlue;
 
             BuildGuests();
 
@@ -101,7 +101,7 @@ namespace ACE.Server.WorldObjects
             return houseData;
         }
 
-        public static House Load(uint houseGuid)
+        public static House Load(uint houseGuid, bool isBasement = false)
         {
             var landblock = (ushort)((houseGuid >> 12) & 0xFFFF);
 
@@ -125,6 +125,9 @@ namespace ACE.Server.WorldObjects
                 linkedHouse.ActivateLinks(instances, new List<Biota>() { biota }, linkedHouses[0]);
 
             var house = (House)linkedHouses[0];
+
+            if (isBasement)
+                return house;
 
             // load slumlord biota for rent
             if (house.SlumLord == null)
@@ -192,19 +195,23 @@ namespace ACE.Server.WorldObjects
         {
             // for house dungeons, link to outdoor house properties
             var house = this;
-            if (CurrentLandblock != null && CurrentLandblock.IsDungeon && HouseType != HouseType.Apartment)
+            if (CurrentLandblock != null && CurrentLandblock.HasDungeon && HouseType != HouseType.Apartment)
             {
-                var biota = DatabaseManager.Shard.GetBiotasByWcid(WeenieClassId).FirstOrDefault(b => b.BiotaPropertiesPosition.FirstOrDefault(p => p.PositionType == (ushort)PositionType.Location).ObjCellId >> 16 != Location.Landblock);
+                var biota = DatabaseManager.Shard.GetBiotasByWcid(WeenieClassId).Where(bio => bio.BiotaPropertiesPosition.Count > 0).FirstOrDefault(b => b.BiotaPropertiesPosition.FirstOrDefault(p => p.PositionType == (ushort)PositionType.Location).ObjCellId >> 16 != Location.Landblock);
                 if (biota != null)
                 {
                     house = WorldObjectFactory.CreateWorldObject(biota) as House;
                     HouseOwner = house.HouseOwner;
+                    HouseOwnerName = house.HouseOwnerName;
                 }
             }
 
+            //Console.WriteLine($"House.SetLinkProperties({wo.Name}) (0x{wo.Guid}): WeenieType {wo.WeenieType} | HouseId:{house.HouseId} | HouseOwner: {house.HouseOwner} | HouseOwnerName: {house.HouseOwnerName}");
+
             wo.HouseId = house.HouseId;
             wo.HouseOwner = house.HouseOwner;
-            wo.HouseInstance = house.HouseInstance;
+            //wo.HouseInstance = house.HouseInstance;
+            //wo.HouseOwnerName = house.HouseOwnerName;
 
             if (house.HouseOwner != null && wo is SlumLord)
                 wo.CurrentMotionState = new Motion(MotionStance.Invalid, MotionCommand.On);
@@ -218,7 +225,7 @@ namespace ACE.Server.WorldObjects
                     hook.UiHidden = false;
                     hook.Ethereal = false;
                 }
-                else if (!(HouseHooksVisible ?? true))
+                else if (!(house.HouseHooksVisible ?? true))
                 {
                     hook.NoDraw = true;
                     hook.UiHidden = true;
@@ -270,7 +277,7 @@ namespace ACE.Server.WorldObjects
 
             var owner = PlayerManager.FindByGuid(HouseOwner.Value);
 
-            if (owner != null && owner.Account.AccountId == player.Account.AccountId)
+            if (owner != null && owner.Account != null && owner.Account.AccountId == player.Account.AccountId)
                 return true;
 
             // handle allegiance permissions
@@ -306,15 +313,30 @@ namespace ACE.Server.WorldObjects
 
             var housePermissions = Biota.GetHousePermission(BiotaDatabaseLock);
 
+            var deleted = new List<uint>();
+
             foreach (var housePermission in Biota.HousePermission)
             {
                 var player = PlayerManager.FindByGuid(housePermission.PlayerGuid);
                 if (player == null)
                 {
                     Console.WriteLine($"{Name}.BuildGuests(): couldn't find guest {housePermission.PlayerGuid:X8}");
+
+                    // character has been deleted -- automatically remove?
+                    deleted.Add(housePermission.PlayerGuid);
                     continue;
                 }
                 Guests.Add(player.Guid, housePermission.Storage);
+            }
+
+            if (deleted.Count > 0)
+            {
+                foreach (var guid in deleted)
+                    Biota.TryRemoveHousePermission(guid, out var entity, BiotaDatabaseLock);
+
+                ChangesDetected = true;
+
+                SaveBiotaToDatabase();
             }
         }
 
@@ -434,12 +456,17 @@ namespace ACE.Server.WorldObjects
             {
                 if (_dungeonHouseGuid == null)
                 {
-                    var housePortals = GetHousePortals();
-
-                    if (housePortals.Count == 0)
+                    if (DungeonLandblockID == 0)
                         return 0;
 
-                    _dungeonHouseGuid = housePortals[0].Id;
+                    var landblock = (ushort)((DungeonLandblockID >> 16) & 0xFFFF);
+
+                    var basementGuid = DatabaseManager.World.GetCachedBasementHouseGuid(landblock);
+
+                    if (basementGuid == 0)
+                        return 0;
+
+                    _dungeonHouseGuid = basementGuid;
 
                 }
                 return _dungeonHouseGuid.Value;
@@ -499,13 +526,13 @@ namespace ACE.Server.WorldObjects
                 // and the outdoor house landblock is still unloaded. the reference to the outdoor House will be a shallow reference at that point,
                 // and this should only happen for outdoor landblocks
 
-                if (CurrentLandblock == null || !CurrentLandblock.IsDungeon)
+                if (CurrentLandblock == null || !CurrentLandblock.HasDungeon)
                 {
                     _rootGuid = Guid;
                     return Guid;
                 }
 
-                var biota = DatabaseManager.Shard.GetBiotasByWcid(WeenieClassId).FirstOrDefault(b => b.BiotaPropertiesPosition.FirstOrDefault(p => p.PositionType == (ushort)PositionType.Location).ObjCellId >> 16 != Location?.Landblock);
+                var biota = DatabaseManager.Shard.GetBiotasByWcid(WeenieClassId).Where(bio => bio.BiotaPropertiesPosition.Count > 0).FirstOrDefault(b => b.BiotaPropertiesPosition.FirstOrDefault(p => p.PositionType == (ushort)PositionType.Location).ObjCellId >> 16 != Location?.Landblock);
                 if (biota == null)
                 {
                     var instance = DatabaseManager.World.GetLandblockInstancesByWcid(WeenieClassId).FirstOrDefault(w => w.ObjCellId >> 16 != Location?.Landblock);
@@ -557,7 +584,7 @@ namespace ACE.Server.WorldObjects
             var isLoaded = LandblockManager.IsLoaded(landblockId);
 
             if (!isLoaded)
-                return null;
+                return House.Load(DungeonHouseGuid, true);
 
             var loaded = LandblockManager.GetLandblock(landblockId, false);
             var wos = loaded.GetWorldObjectsForPhysicsHandling();
@@ -581,7 +608,7 @@ namespace ACE.Server.WorldObjects
 
             if (HasDungeon)
             {
-                if ((player.Location.Cell | 0xFFFF) == DungeonLandblockID)
+                if ((player.Location.Cell | 0xFFFF) == DungeonLandblockID && (player.Location.Cell & 0xFFFF) >= 0x100)
                     return true;
             }
             return false;
@@ -609,38 +636,37 @@ namespace ACE.Server.WorldObjects
             return booted;
         }
 
-        public void UpdateRestrictionDB()
+        public void UpdateRestrictionDB(RestrictionDB restrictions = null)
         {
             // get restrictions for root house
-            var restrictions = new RestrictionDB(this);
+            if (restrictions == null) restrictions = new RestrictionDB(this);
 
-            UpdateRestrictionDB(restrictions);
+            SendRestrictionDB(restrictions);
 
             // for mansions, update the linked houses
             foreach (var linkedHouse in LinkedHouses)
-                linkedHouse.UpdateRestrictionDB(restrictions);
+                linkedHouse.SendRestrictionDB(restrictions);
 
             // update house dungeon
 
-            // TODO: handle this more gracefully: player in house dungeon,
-            // but outdoor house landblock is unloaded, and player is evicted
-            if (CurrentLandblock != null && HasDungeon)
+            if (HasDungeon)
             {
                 var dungeonHouse = GetDungeonHouse();
                 if (dungeonHouse == null || dungeonHouse.PhysicsObj == null) return;
 
-                dungeonHouse.UpdateRestrictionDB(restrictions);
+                dungeonHouse.SendRestrictionDB(restrictions);
             }
         }
 
-        public void UpdateRestrictionDB(RestrictionDB restrictions)
+        public void SendRestrictionDB(RestrictionDB restrictions)
         {
             if (PhysicsObj == null)
                 return;
 
-            var nearbyPlayers = PhysicsObj.ObjMaint.KnownPlayers.Values.Select(v => v.WeenieObj.WorldObject).OfType<Player>().ToList();
+            var nearbyPlayers = PhysicsObj.ObjMaint.GetKnownPlayersValuesAsPlayer();
             foreach (var player in nearbyPlayers)
-                player.Session.Network.EnqueueSend(new GameEventHouseUpdateRestrictions(player.Session, this, restrictions));
+                player.Session.Network.EnqueueSend(new GameMessagePublicUpdateInstanceID(this, PropertyInstanceId.HouseOwner, new ObjectGuid(restrictions.HouseOwner)),
+                                                   new GameEventHouseUpdateRestrictions(player.Session, this, restrictions));
         }
 
         public void ClearRestrictions()
@@ -649,13 +675,7 @@ namespace ACE.Server.WorldObjects
 
             var restrictionDB = new RestrictionDB();
 
-            var nearbyPlayers = PhysicsObj.ObjMaint.KnownPlayers.Values.Select(v => v.WeenieObj.WorldObject).OfType<Player>().ToList();
-            foreach (var player in nearbyPlayers)
-            {
-                // clear house owner
-                player.Session.Network.EnqueueSend(new GameMessagePublicUpdateInstanceID(this, PropertyInstanceId.HouseOwner, ObjectGuid.Invalid));
-                player.Session.Network.EnqueueSend(new GameEventHouseUpdateRestrictions(player.Session, this, restrictionDB));
-            }
+            UpdateRestrictionDB(restrictionDB);
         }
     }
 }

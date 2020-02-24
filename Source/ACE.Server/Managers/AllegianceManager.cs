@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+
 using ACE.Database;
 using ACE.Entity;
 using ACE.Entity.Enum.Properties;
 using ACE.Server.Entity;
+using ACE.Server.Entity.Actions;
 using ACE.Server.Factories;
 using ACE.Server.Network.GameEvent.Events;
 using ACE.Server.Network.GameMessages.Messages;
@@ -353,10 +355,7 @@ namespace ACE.Server.Managers
 
             if (player.MonarchId != null)
             {
-                player.MonarchId = null;
-
-                if (onlinePlayer != null)
-                    onlinePlayer.Session.Network.EnqueueSend(new GameMessagePrivateUpdateInstanceID(onlinePlayer, PropertyInstanceId.Monarch, 0));
+                player.UpdateProperty(PropertyInstanceId.Monarch, null, true);
 
                 updated = true;
             }
@@ -384,7 +383,14 @@ namespace ACE.Server.Managers
             return allegiance;
         }
 
+        // This function is called from a database callback.
+        // We must add thread safety to prevent AllegianceManager corruption
         public static void HandlePlayerDelete(uint playerGuid)
+        {
+            WorldManager.EnqueueAction(new ActionEventDelegate(() => DoHandlePlayerDelete(playerGuid)));
+        }
+
+        private static void DoHandlePlayerDelete(uint playerGuid)
         {
             var player = PlayerManager.FindByGuid(playerGuid);
             if (player == null)
@@ -409,7 +415,7 @@ namespace ACE.Server.Managers
             }
 
             player.PatronId = null;
-            player.MonarchId = null;
+            player.UpdateProperty(PropertyInstanceId.Monarch, null, true);
 
             // vassals now become monarchs...
             foreach (var vassalNode in allegianceNode.Vassals.Values)
@@ -419,12 +425,12 @@ namespace ACE.Server.Managers
                 if (vassal == null) continue;
 
                 vassal.PatronId = null;
-                vassal.MonarchId = null;
+                vassal.UpdateProperty(PropertyInstanceId.Monarch, null, true);
 
                 // walk the allegiance tree from this node, update monarch ids
                 vassalNode.Walk((node) =>
                 {
-                    node.Player.MonarchId = vassalNode.PlayerGuid.Full;
+                    node.Player.UpdateProperty(PropertyInstanceId.Monarch, vassalNode.PlayerGuid.Full, true);
 
                     node.Player.SaveBiotaToDatabase();
 
@@ -448,6 +454,15 @@ namespace ACE.Server.Managers
             // save immediately?
             foreach (var p in players)
                 p.SaveBiotaToDatabase();
+
+            foreach (var p in players)
+            {
+                Player.CheckAllegianceHouse(p.Guid);
+
+                var newAllegiance = GetAllegiance(p);
+                if (newAllegiance != null)
+                    newAllegiance.Monarch.Walk((node) => Player.CheckAllegianceHouse(node.PlayerGuid), false);
+            }
         }
     }
 }

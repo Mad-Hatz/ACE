@@ -11,10 +11,12 @@ using Microsoft.EntityFrameworkCore.Storage;
 
 using log4net;
 
+using ACE.Common;
 using ACE.Database.Entity;
 using ACE.Database.Models.World;
 using ACE.Entity.Enum;
 using ACE.Entity.Enum.Properties;
+
 using Version = ACE.Database.Models.World.Version;
 
 namespace ACE.Database
@@ -33,12 +35,12 @@ namespace ACE.Database
                 {
                     if (((RelationalDatabaseCreator)context.Database.GetService<IDatabaseCreator>()).Exists())
                     {
-                        log.Debug($"Successfully connected to {config.Database} database on {config.Host}:{config.Port}.");
+                        log.Debug($"[DATABASE] Successfully connected to {config.Database} database on {config.Host}:{config.Port}.");
                         return true;
                     }
                 }
 
-                log.Error($"Attempting to reconnect to {config.Database} database on {config.Host}:{config.Port} in 5 seconds...");
+                log.Error($"[DATABASE] Attempting to reconnect to {config.Database} database on {config.Host}:{config.Port} in 5 seconds...");
 
                 if (retryUntilFound)
                     Thread.Sleep(5000);
@@ -131,7 +133,11 @@ namespace ACE.Database
         public Weenie GetWeenie(uint weenieClassId)
         {
             using (var context = new WorldDbContext())
+            {
+                context.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
+
                 return GetWeenie(context, weenieClassId);
+            }
         }
 
         /// <summary>
@@ -328,7 +334,7 @@ namespace ACE.Database
                     .AsNoTracking()
                     .ToList();
 
-                Parallel.ForEach(results, result =>
+                Parallel.ForEach(results, ConfigManager.Config.Server.Threading.DatabaseParallelOptions, result =>
                 {
                     if (!weenieCache.ContainsKey(result.ClassId))
                         GetWeenie(result.ClassId);
@@ -424,12 +430,37 @@ namespace ACE.Database
         }
 
         /// <summary>
+        /// Clears the cached landblock instances for all landblocks
+        /// </summary>
+        public void ClearCachedLandblockInstances()
+        {
+            cachedLandblockInstances.Clear();
+        }
+
+        /// <summary>
+        /// Clears the cached landblock instances for a specific landblock
+        /// </summary>
+        public bool ClearCachedInstancesByLandblock(ushort landblock)
+        {
+            using (var context = new WorldDbContext())
+                return ClearCachedInstancesByLandblock(context, landblock);
+        }
+
+        /// <summary>
         /// Returns statics spawn map and their links for the landblock
         /// </summary>
         public List<LandblockInstance> GetCachedInstancesByLandblock(ushort landblock)
         {
             using (var context = new WorldDbContext())
                 return GetCachedInstancesByLandblock(context, landblock);
+        }
+
+        /// <summary>
+        /// Clears the cached landblock instances for a specific landblock
+        /// </summary>
+        public bool ClearCachedInstancesByLandblock(WorldDbContext context, ushort landblock)
+        {
+            return cachedLandblockInstances.TryRemove(landblock, out _);
         }
 
         public List<LandblockInstance> GetCachedInstancesByLandblock(WorldDbContext context, ushort landblock)
@@ -485,6 +516,33 @@ namespace ACE.Database
             }
         }
 
+        private readonly ConcurrentDictionary<ushort, uint> cachedBasementHouseGuids = new ConcurrentDictionary<ushort, uint>();
+
+        public uint GetCachedBasementHouseGuid(ushort landblock)
+        {
+            if (cachedBasementHouseGuids.TryGetValue(landblock, out var value))
+                return value;
+
+            using (var context = new WorldDbContext())
+            {
+                var result = context.LandblockInstance
+                    .AsNoTracking()
+                    .Where(r => r.Landblock == landblock
+                            && r.WeenieClassId != 11730 /* Exclude House Portal */
+                            && r.WeenieClassId != 278   /* Exclude Door */
+                            && r.WeenieClassId != 568   /* Exclude Door (entry) */
+                            && !r.IsLinkChild)
+                    .FirstOrDefault();
+
+                if (result == null)
+                    return 0;
+
+                cachedBasementHouseGuids[landblock] = result.Guid;
+
+                return result.Guid;
+            }
+        }
+
         private readonly ConcurrentDictionary<uint, List<HousePortal>> cachedHousePortals = new ConcurrentDictionary<uint, List<HousePortal>>();
 
         public List<HousePortal> GetCachedHousePortals(uint houseId)
@@ -514,8 +572,8 @@ namespace ACE.Database
             {
                 var results = context.HousePortal
                     .AsNoTracking()
-                    .GroupBy(r => r.HouseId)
-                    .ToList();
+                    .AsEnumerable()
+                    .GroupBy(r => r.HouseId);
 
                 foreach (var result in results)
                     cachedHousePortals[result.Key] = result.ToList();
@@ -605,6 +663,26 @@ namespace ACE.Database
         {
             lock (cookbookCache)
                 return cookbookCache.Count(r => r.Value != null);
+        }
+
+        public void ClearCookbookCache()
+        {
+            lock (cookbookCache)
+                cookbookCache.Clear();
+        }
+
+        public List<CookBook> GetCachedCookbooks(uint recipeId)
+        {
+            var results = new List<CookBook>();
+
+            using (var ctx = new WorldDbContext())
+            {
+                var cookbooks = ctx.CookBook.Where(i => i.RecipeId == recipeId).ToList();
+
+                foreach (var cookbook in cookbooks)
+                    results.Add(GetCachedCookbook(cookbook.SourceWCID, cookbook.TargetWCID));
+            }
+            return results;
         }
 
         public CookBook GetCachedCookbook(uint sourceWeenieClassid, uint targetWeenieClassId)
@@ -704,7 +782,7 @@ namespace ACE.Database
                     .AsNoTracking()
                     .ToList();
 
-                Parallel.ForEach(results, result =>
+                Parallel.ForEach(results, ConfigManager.Config.Server.Threading.DatabaseParallelOptions, result =>
                 {
                     GetCachedCookbook(result.SourceWCID, result.TargetWCID);
                 });
@@ -725,6 +803,11 @@ namespace ACE.Database
         }
 
         private readonly ConcurrentDictionary<uint, Spell> spellCache = new ConcurrentDictionary<uint, Spell>();
+
+        public void ClearSpellCache()
+        {
+            spellCache.Clear();
+        }
 
         /// <summary>
         /// Returns the number of Spells currently cached.
@@ -918,8 +1001,8 @@ namespace ACE.Database
             {
                 var results = context.TreasureWielded
                     .AsNoTracking()
-                    .GroupBy(r => r.TreasureType)
-                    .ToList();
+                    .AsEnumerable()
+                    .GroupBy(r => r.TreasureType);
 
                 foreach (var result in results)
                     cachedWieldedTreasure[result.Key] = result.ToList();
@@ -957,8 +1040,8 @@ namespace ACE.Database
             {
                 var results = context.TreasureMaterialColor
                     .AsNoTracking()
-                    .GroupBy(r => r.MaterialId)
-                    .ToList();
+                    .AsEnumerable()
+                    .GroupBy(r => r.MaterialId);
 
                 foreach (var result in results)
                     cachedTreasureMaterialColor[(int)result.Key] = result.ToList();
@@ -991,8 +1074,8 @@ namespace ACE.Database
             {
                 var results = context.TreasureMaterialBase
                     .AsNoTracking()
-                    .GroupBy(r => r.MaterialCode)
-                    .ToList();
+                    .AsEnumerable()
+                    .GroupBy(r => r.MaterialCode);
 
                 foreach (var result in results)
                     cachedTreasureMaterialBase[(int)result.Key] = result.ToList();
@@ -1037,8 +1120,8 @@ namespace ACE.Database
             {
                 var results = context.TreasureMaterialGroups
                     .AsNoTracking()
-                    .GroupBy(r => r.MaterialGroup)
-                    .ToList();
+                    .AsEnumerable()
+                    .GroupBy(r => r.MaterialGroup);
 
                 foreach (var result in results)
                 cachedTreasureMaterialGroups[(int)result.Key] = result.ToList();
@@ -1048,6 +1131,11 @@ namespace ACE.Database
         #endregion
 
         private readonly ConcurrentDictionary<string, Quest> cachedQuest = new ConcurrentDictionary<string, Quest>();
+
+        public bool ClearCachedQuest(string questName)
+        {
+            return cachedQuest.TryRemove(questName, out _);
+        }
 
         public Quest GetCachedQuest(string questName)
         {

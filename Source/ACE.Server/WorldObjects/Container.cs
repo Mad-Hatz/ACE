@@ -12,6 +12,7 @@ using ACE.Entity.Enum;
 using ACE.Entity.Enum.Properties;
 using ACE.Server.Entity.Actions;
 using ACE.Server.Factories;
+using ACE.Server.Managers;
 using ACE.Server.Network.GameMessages.Messages;
 using ACE.Server.Network.GameEvent.Events;
 using ACE.Server.Network.GameMessages;
@@ -408,6 +409,20 @@ namespace ACE.Server.WorldObjects
         }
 
         /// <summary>
+        /// Returns TRUE if there are enough free inventory slots and burden available to add item
+        /// </summary>
+        public bool CanAddToContainer(WorldObject worldObject, bool includeSidePacks = true)
+        {
+            if (this is Player player && !player.HasEnoughBurdenToAddToInventory(worldObject))
+                return false;
+
+            if (worldObject.UseBackpackSlot)
+                return GetFreeContainerSlots() > 0;
+            else
+                return GetFreeInventorySlots(includeSidePacks) > 0;
+        }
+
+        /// <summary>
         /// If enough burden is available, this will try to add an item to the main pack. If the main pack is full, it will try to add it to the first side pack with room.<para />
         /// It will also increase the EncumbranceVal and Value.
         /// </summary>
@@ -605,7 +620,17 @@ namespace ACE.Server.WorldObjects
                 else if (Viewer == player.Guid.Full)
                     Close(player);
                 else
-                    player.Session.Network.EnqueueSend(new GameEventCommunicationTransientString(player.Session, $"The {Name} is already in use by someone else!"));
+                {
+                    var currentViewer = "someone else";
+                    if (PropertyManager.GetBool("container_opener_name").Item)
+                    {
+                        var name = CurrentLandblock?.GetObject(Viewer)?.Name;
+                        if (name != null)
+                            currentViewer = name;
+                    }
+
+                    player.Session.Network.EnqueueSend(new GameEventCommunicationTransientString(player.Session, $"The {Name} is already in use by {currentViewer}!"));
+                }
             }
         }
 
@@ -668,6 +693,26 @@ namespace ACE.Server.WorldObjects
             // send sub-containers
             foreach (var container in Inventory.Values.Where(i => i is Container))
                 player.Session.Network.EnqueueSend(new GameEventViewContents(player.Session, (Container)container));
+
+            player.Session.Network.EnqueueSend(itemsToSend.ToArray());
+        }
+
+        private void SendDeletesForMyInventory(Player player)
+        {
+            // send deleteobjects for all objects in this container's inventory to player
+            var itemsToSend = new List<GameMessage>();
+
+            foreach (var item in Inventory.Values)
+            {
+                // FIXME: only send messages for known objects
+                itemsToSend.Add(new GameMessageDeleteObject(item));
+
+                if (item is Container container)
+                {
+                    foreach (var containerItem in container.Inventory.Values)
+                        itemsToSend.Add(new GameMessageDeleteObject(containerItem));
+                }
+            }
 
             player.Session.Network.EnqueueSend(itemsToSend.ToArray());
         }
@@ -782,7 +827,8 @@ namespace ACE.Server.WorldObjects
                     if (sourceItem.StackSize == 0)
                     {
                         TryRemoveFromInventory(sourceItem.Guid);
-                        sourceItem.Destroy();
+                        if (!sourceItem.IsDestroyed)
+                            sourceItem.Destroy();
                         break;
                     }
                 }
@@ -816,6 +862,23 @@ namespace ACE.Server.WorldObjects
         public virtual MotionCommand MotionPickup => MotionCommand.Pickup;
 
         public override bool IsAttunedOrContainsAttuned => base.IsAttunedOrContainsAttuned || Inventory.Values.Any(i => i.IsAttunedOrContainsAttuned);
+
+        public override bool IsStickyAttunedOrContainsStickyAttuned => base.IsStickyAttunedOrContainsStickyAttuned || Inventory.Values.Any(i => i.IsStickyAttunedOrContainsStickyAttuned);
+
+        public override bool IsUniqueOrContainsUnique => base.IsUniqueOrContainsUnique || Inventory.Values.Any(i => i.IsUniqueOrContainsUnique);
+
+        public override List<WorldObject> GetUniqueObjects()
+        {
+            var uniqueObjects = new List<WorldObject>();
+
+            if (Unique != null)
+                uniqueObjects.Add(this);
+
+            foreach (var item in Inventory.Values)
+                uniqueObjects.AddRange(item.GetUniqueObjects());
+
+            return uniqueObjects;
+        }
 
         public override void OnTalk(WorldObject activator)
         {

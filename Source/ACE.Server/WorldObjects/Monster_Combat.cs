@@ -1,7 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+
+using ACE.Common;
+using ACE.Database;
 using ACE.Database.Models.Shard;
+using ACE.Database.Models.World;
 using ACE.DatLoader;
 using ACE.DatLoader.FileTypes;
 using ACE.Entity.Enum;
@@ -85,7 +89,8 @@ namespace ACE.Server.WorldObjects
                 return CombatType.Missile;
 
             // if caster, roll for spellcasting chance
-            if (!IsCaster || !RollCastMagic())
+            //if (!IsCaster || !RollCastMagic())
+            if (!IsCaster || TryRollSpell() == null)
                 return CombatType.Melee;
             else
                 return CombatType.Magic;
@@ -132,10 +137,13 @@ namespace ACE.Server.WorldObjects
 
         public float GetMaxRange()
         {
+            // FIXME
+            var it = 0;
+
             while (CurrentAttack == CombatType.Magic)
             {
                 // select a magic spell
-                CurrentSpell = GetRandomSpell();
+                //CurrentSpell = GetRandomSpell();
                 var currentSpell = GetCurrentSpell();
 
                 if (currentSpell.IsProjectile)
@@ -145,9 +153,13 @@ namespace ACE.Server.WorldObjects
                     {
                         // reroll attack type
                         CurrentAttack = GetNextAttackType();
-                        continue;
+                        it++;
 
                         // max iterations to melee?
+                        if (it >= 30)
+                            CurrentAttack = CombatType.Melee;
+
+                        continue;
                     }
                 }
                 return GetSpellMaxRange();
@@ -172,6 +184,7 @@ namespace ACE.Server.WorldObjects
                 return false;
 
             PhysicsObj.update_object();
+            UpdatePosition_SyncLocation();
 
             return !PhysicsObj.IsAnimating;
         }
@@ -186,6 +199,7 @@ namespace ACE.Server.WorldObjects
                 return false;
 
             PhysicsObj.update_object();
+            UpdatePosition_SyncLocation();
 
             return !PhysicsObj.IsAnimating;
         }
@@ -258,7 +272,7 @@ namespace ACE.Server.WorldObjects
             // splatter effects
             var hitSound = new GameMessageSound(Guid, Sound.HitFlesh1, 0.5f);
             //var splatter = (PlayScript)Enum.Parse(typeof(PlayScript), "Splatter" + playerSource.GetSplatterHeight() + playerSource.GetSplatterDir(this));
-            var splatter = new GameMessageScript(Guid, damageType == DamageType.Nether ? ACE.Entity.Enum.PlayScript.HealthDownVoid : ACE.Entity.Enum.PlayScript.DirtyFightingDamageOverTime);
+            var splatter = new GameMessageScript(Guid, damageType == DamageType.Nether ? PlayScript.HealthDownVoid : PlayScript.DirtyFightingDamageOverTime);
             EnqueueBroadcast(hitSound, splatter);
 
             if (Health.Current <= 0) return;
@@ -305,7 +319,7 @@ namespace ACE.Server.WorldObjects
         /// </summary>
         /// <param name="source">The attacker / source of damage</param>
         /// <param name="amount">The amount of damage rounded</param>
-        public virtual void TakeDamage(WorldObject source, DamageType damageType, float amount, bool crit = false)
+        public virtual uint TakeDamage(WorldObject source, DamageType damageType, float amount, bool crit = false)
         {
             var tryDamage = (uint)Math.Round(amount);
             var damage = (uint)-UpdateVitalDelta(Health, (int)-tryDamage);
@@ -322,6 +336,7 @@ namespace ACE.Server.WorldObjects
 
                 Die();
             }
+            return damage;
         }
 
         public void EmitSplatter(Creature target, float damage)
@@ -336,6 +351,26 @@ namespace ACE.Server.WorldObjects
             }
             var splatter = (PlayScript)Enum.Parse(typeof(PlayScript), "Splatter" + GetSplatterHeight() + GetSplatterDir(target));
             target.EnqueueBroadcast(new GameMessageScript(target.Guid, splatter));
+        }
+
+        public CombatStyle AiAllowedCombatStyle
+        {
+            get => (CombatStyle)(GetProperty(PropertyInt.AiAllowedCombatStyle) ?? 0);
+            set { if (value == 0) RemoveProperty(PropertyInt.AiAllowedCombatStyle); else SetProperty(PropertyInt.AiAllowedCombatStyle, (int)value); }
+        }
+
+        private static readonly Dictionary<uint, BodyPartTable> BPTableCache = new Dictionary<uint, BodyPartTable>();
+
+        public static BodyPartTable GetBodyParts(uint wcid)
+        {
+            if (!BPTableCache.TryGetValue(wcid, out var bpTable))
+            {
+                var weenie = DatabaseManager.World.GetCachedWeenie(wcid);
+
+                bpTable = new BodyPartTable(weenie);
+                BPTableCache[wcid] = bpTable;
+            }
+            return bpTable;
         }
     }
 }

@@ -99,6 +99,15 @@ namespace ACE.Server.Network.Structure
                 if (!PropertiesBool.ContainsKey(PropertyBool.AppraisalHasAllowedActivator))
                     PropertiesBool.Add(PropertyBool.AppraisalHasAllowedActivator, true);
 
+            if (PropertiesString.ContainsKey(PropertyString.ScribeAccount) && !examiner.IsAdmin && !examiner.IsSentinel && !examiner.IsArch && !examiner.IsPsr)
+                PropertiesString.Remove(PropertyString.ScribeAccount);
+
+            if (PropertiesString.ContainsKey(PropertyString.HouseOwnerAccount) && !examiner.IsAdmin && !examiner.IsSentinel && !examiner.IsArch && !examiner.IsPsr)
+                PropertiesString.Remove(PropertyString.HouseOwnerAccount);
+
+            if (PropertiesInt.ContainsKey(PropertyInt.Lifespan))
+                PropertiesInt[PropertyInt.RemainingLifespan] = wo.GetRemainingLifespan();
+
             // armor / clothing / shield
             if (wo is Clothing || wo.IsShield)
                 BuildArmor(wo);
@@ -219,39 +228,56 @@ namespace ACE.Server.Network.Structure
             {
                 // If the hook has any inventory, we need to send THOSE properties instead.
                 var hook = wo as Container;
+
+                string baseDescString = "";
+                if (wo.ParentLink.HouseOwner != null)
+                {
+                    // This is for backwards compatibility. This value was not set/saved in earlier versions.
+                    // It will get the player's name and save that to the HouseOwnerName property of the house. This is now done when a player purchases a house.
+                    if (wo.ParentLink.HouseOwnerName == null)
+                    {
+                        var houseOwnerPlayer = PlayerManager.FindByGuid((uint)wo.ParentLink.HouseOwner);
+                        if (houseOwnerPlayer != null)
+                        {
+                            wo.ParentLink.HouseOwnerName = houseOwnerPlayer.Name;
+                            wo.ParentLink.SaveBiotaToDatabase();
+                        }
+                    }
+                    baseDescString = "This hook is owned by " + wo.ParentLink.HouseOwnerName + ". "; //if house is owned, display this text
+                }
+
+                var containsString = "";
                 if (hook.Inventory.Count == 1)
                 {
                     WorldObject hookedItem = hook.Inventory.First().Value;
 
                     // Hooked items have a custom "description", containing the desc of the sub item and who the owner of the house is (if any)
                     BuildProfile(hookedItem, examiner, success);
-                    string baseDescString = "";
-                    if (wo.ParentLink.HouseOwner != null)
-                    {
-                        // This is for backwards compatibility. This value was not set/saved in earlier versions.
-                        // It will get the player's name and save that to the HouseOwnerName property of the house. This is now done when a player purchases a house.
-                        if(wo.ParentLink.HouseOwnerName == null)
-                        {
-                            var houseOwnerPlayer = PlayerManager.FindByGuid((uint)wo.ParentLink.HouseOwner);
-                            if(houseOwnerPlayer != null)
-                            {
-                                wo.ParentLink.HouseOwnerName = houseOwnerPlayer.Name;
-                                wo.ParentLink.SaveBiotaToDatabase();
-                            }
-                        }
-                        baseDescString = "This hook is owned by " + wo.ParentLink.HouseOwnerName + ". "; //if house is owned, display this text
-                    }
+
+                    containsString = "It contains: \n";
+
                     if (PropertiesString.ContainsKey(PropertyString.LongDesc) && PropertiesString[PropertyString.LongDesc] != null)
                     {
-                        PropertiesString[PropertyString.LongDesc] = baseDescString + "It contains: \n" + PropertiesString[PropertyString.LongDesc];
+                        containsString += PropertiesString[PropertyString.LongDesc];
                     }
                     else if (PropertiesString.ContainsKey(PropertyString.ShortDesc) && PropertiesString[PropertyString.ShortDesc] != null)
                     {
-                        PropertiesString[PropertyString.LongDesc] = baseDescString + "It contains: \n" + PropertiesString[PropertyString.ShortDesc];
+                        containsString += PropertiesString[PropertyString.ShortDesc];
+                    }
+                    else
+                    {
+                        containsString += PropertiesString[PropertyString.Name];
                     }
 
                     BuildHookProfile(hookedItem);
                 }
+
+                if (PropertiesString.ContainsKey(PropertyString.LongDesc) && PropertiesString[PropertyString.LongDesc] != null)
+                    PropertiesString[PropertyString.LongDesc] = baseDescString + containsString;
+                else if (PropertiesString.ContainsKey(PropertyString.ShortDesc) && PropertiesString[PropertyString.ShortDesc] != null)
+                    PropertiesString[PropertyString.LongDesc] = baseDescString + containsString;
+                else
+                    PropertiesString[PropertyString.LongDesc] = baseDescString + containsString;
             }
 
             if (wo is ManaStone)
@@ -332,38 +358,42 @@ namespace ACE.Server.Network.Structure
             if (wo.ItemSkillLimit != null)
                 PropertiesInt[PropertyInt.AppraisalItemSkill] = (int)wo.ItemSkillLimit;
 
-            if (wielder == null || !wo.IsEnchantable) return;
-
             if (PropertiesFloat.ContainsKey(PropertyFloat.WeaponDefense) && !(wo is Missile) && !(wo is Ammunition))
             {
                 var defenseMod = wo.EnchantmentManager.GetDefenseMod();
-                var auraDefenseMod = wo.IsEnchantable ? wielder.EnchantmentManager.GetDefenseMod() : 0.0f;
+                var auraDefenseMod = wielder != null && wo.IsEnchantable ? wielder.EnchantmentManager.GetDefenseMod() : 0.0f;
 
                 PropertiesFloat[PropertyFloat.WeaponDefense] += defenseMod + auraDefenseMod;
             }
 
-            if (PropertiesFloat.ContainsKey(PropertyFloat.ManaConversionMod))
+            if (PropertiesFloat.TryGetValue(PropertyFloat.ManaConversionMod, out var manaConvMod))
             {
-                var manaConvMod = wielder.EnchantmentManager.GetManaConvMod();
-                if (manaConvMod != 1.0f)
+                if (manaConvMod != 0)
                 {
-                    PropertiesFloat[PropertyFloat.ManaConversionMod] *= manaConvMod;
+                    // hermetic link/void
+                    var enchantmentMod = ResistMaskHelper.GetManaConversionMod(wielder, wo);
 
-                    ResistHighlight = ResistMaskHelper.GetHighlightMask(wielder);
-                    ResistColor = ResistMaskHelper.GetColorMask(wielder);
+                    if (enchantmentMod != 1.0f)
+                    {
+                        PropertiesFloat[PropertyFloat.ManaConversionMod] *= enchantmentMod;
+
+                        ResistHighlight = ResistMaskHelper.GetHighlightMask(wielder, wo);
+                        ResistColor = ResistMaskHelper.GetColorMask(wielder, wo);
+                    }
+                }
+                else if (!PropertyManager.GetBool("show_mana_conv_bonus_0").Item)
+                {
+                    PropertiesFloat.Remove(PropertyFloat.ManaConversionMod);
                 }
             }
 
             if (PropertiesFloat.ContainsKey(PropertyFloat.ElementalDamageMod))
             {
-                var weaponEnchantments = wo.EnchantmentManager.GetElementalDamageMod();
-                var wielderEnchantments = wielder.EnchantmentManager.GetElementalDamageMod();
+                var enchantmentBonus = ResistMaskHelper.GetElementalDamageBonus(wielder, wo);
 
-                var enchantments = weaponEnchantments + wielderEnchantments;
-
-                if (enchantments != 0)
+                if (enchantmentBonus != 0)
                 {
-                    PropertiesFloat[PropertyFloat.ElementalDamageMod] += enchantments;
+                    PropertiesFloat[PropertyFloat.ElementalDamageMod] += enchantmentBonus;
 
                     ResistHighlight = ResistMaskHelper.GetHighlightMask(wielder, wo);
                     ResistColor = ResistMaskHelper.GetColorMask(wielder, wo);
@@ -539,6 +569,7 @@ namespace ACE.Server.Network.Structure
             var critDamageResistRating = creature.GetCritDamageResistRating();
 
             var healingBoostRating = creature.GetHealingBoostRating();
+            var dotResistRating = creature.GetDotResistanceRating();
             var netherResistRating = creature.GetNetherResistRating();
 
             var lifeResistRating = creature.GetLifeResistRating();  // drain / harm resistance
@@ -563,6 +594,8 @@ namespace ACE.Server.Network.Structure
                 PropertiesInt[PropertyInt.HealingBoostRating] = healingBoostRating;
             if (netherResistRating != 0)
                 PropertiesInt[PropertyInt.NetherResistRating] = netherResistRating;
+            if (dotResistRating != 0)
+                PropertiesInt[PropertyInt.DotResistRating] = dotResistRating;
 
             if (lifeResistRating != 0)
                 PropertiesInt[PropertyInt.LifeResistRating] = lifeResistRating;
@@ -599,22 +632,18 @@ namespace ACE.Server.Network.Structure
         private void BuildHookProfile(WorldObject hookedItem)
         {
             HookProfile = new HookProfile();
-            if (hookedItem.Inscription != null)
+            if (hookedItem.Inscribable)
                 HookProfile.Flags |= HookFlags.Inscribable;
+            if (hookedItem is Healer)
+                HookProfile.Flags |= HookFlags.IsHealer;
+            if (hookedItem is Food)
+                HookProfile.Flags |= HookFlags.IsFood;
+            if (hookedItem is Lockpick)
+                HookProfile.Flags |= HookFlags.IsLockpick;
             if (hookedItem.ValidLocations != null)
-                HookProfile.ValidLocations = (uint)hookedItem.ValidLocations;
-
-            // This only handles basic Arrow, Quarrels and Darts. It does not, for instance, handle Crystal Arrows.
-            // How were those handled?
+                HookProfile.ValidLocations = hookedItem.ValidLocations.Value;
             if (hookedItem.AmmoType != null)
-            {
-                if ((hookedItem.AmmoType & AmmoType.Arrow) != 0)
-                    HookProfile.AmmoType |= HookAmmoType.Arrow;
-                if ((hookedItem.AmmoType & AmmoType.Bolt) != 0)
-                    HookProfile.AmmoType |= HookAmmoType.Bolt;
-                if ((hookedItem.AmmoType & AmmoType.Atlatl) != 0)
-                    HookProfile.AmmoType |= HookAmmoType.Dart;
-            }
+                HookProfile.AmmoType = hookedItem.AmmoType.Value;
         }
 
         /// <summary>

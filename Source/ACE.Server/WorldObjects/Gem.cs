@@ -46,6 +46,11 @@ namespace ACE.Server.WorldObjects
         /// </summary>
         public override void ActOnUse(WorldObject activator)
         {
+            ActOnUse(activator, false);
+        }
+
+        public void ActOnUse(WorldObject activator, bool confirmed)
+        {
             if (!(activator is Player player))
                 return;
 
@@ -62,6 +67,14 @@ namespace ACE.Server.WorldObjects
             }
 
             // handle rare gems
+            if (RareId != null && player.GetCharacterOption(CharacterOption.ConfirmUseOfRareGems) && !confirmed)
+            {
+                var msg = $"Are you sure you want to use {Name}?";
+                var confirm = new Confirmation_Custom(player.Guid, () => ActOnUse(activator, true));
+                player.ConfirmationManager.EnqueueSend(confirm, msg);
+                return;
+            }
+
             if (RareUsesTimer)
             {
                 var currentTime = Time.GetUnixTime();
@@ -84,9 +97,13 @@ namespace ACE.Server.WorldObjects
 
             if (SpellDID.HasValue)
             {
+                // TODO: Gem 7559 - Condensed Dispel Potion
+                // has values similar to Food, ie. UseUserAnimation - MimeEat,
+                // and UseSound - Drink1
+
                 var spell = new Server.Entity.Spell((uint)SpellDID);
 
-                TryCastSpell(spell, player, this);
+                TryCastSpell(spell, player, this, false);
             }
 
             if (UseCreateContractId > 0)

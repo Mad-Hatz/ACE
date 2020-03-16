@@ -10,10 +10,10 @@ using ACE.Common;
 using ACE.Common.Extensions;
 using ACE.Database;
 using ACE.Database.Models.Shard;
-using ACE.Database.Models.World;
 using ACE.Entity;
 using ACE.Entity.Enum;
 using ACE.Entity.Enum.Properties;
+using ACE.Entity.Models;
 using ACE.Server.Entity;
 using ACE.Server.Entity.Actions;
 using ACE.Server.Managers;
@@ -28,6 +28,7 @@ using ACE.Server.Physics.Common;
 using ACE.Server.Physics.Util;
 using ACE.Server.WorldObjects.Managers;
 
+using Biota = ACE.Database.Models.Shard.Biota;
 using Landblock = ACE.Server.Entity.Landblock;
 using Position = ACE.Entity.Position;
 
@@ -97,7 +98,8 @@ namespace ACE.Server.WorldObjects
         /// </summary>
         protected WorldObject(Weenie weenie, ObjectGuid guid)
         {
-            Biota = weenie.CreateCopyAsBiota(guid.Full);
+            var newBiota = ACE.Entity.Adapter.WeenieConverter.ConvertToBiota(weenie, guid.Full);
+            Biota = ACE.Database.Adapter.BiotaConverter.ConvertFromEntityBiota(newBiota);
             Guid = guid;
 
             InitializePropertyDictionaries();
@@ -403,6 +405,28 @@ namespace ACE.Server.WorldObjects
 
             // check if target object was reached
             var isVisible = transition.CollisionInfo.CollideObject.FirstOrDefault(c => c.ID == PhysicsObj.ID) != null;
+            return isVisible;
+        }
+
+        public bool IsMeleeVisible(WorldObject wo)
+        {
+            if (PhysicsObj == null || wo.PhysicsObj == null)
+                return false;
+
+            var startPos = new Physics.Common.Position(PhysicsObj.Position);
+            var targetPos = new Physics.Common.Position(wo.PhysicsObj.Position);
+
+            PhysicsObj.ProjectileTarget = wo.PhysicsObj;
+
+            // perform line of sight test
+            var transition = PhysicsObj.transition(startPos, targetPos, false);
+
+            PhysicsObj.ProjectileTarget = null;
+
+            if (transition == null) return false;
+
+            // check if target object was reached
+            var isVisible = transition.CollisionInfo.CollideObject.FirstOrDefault(c => c.ID == wo.PhysicsObj.ID) != null;
             return isVisible;
         }
 
@@ -863,11 +887,8 @@ namespace ACE.Server.WorldObjects
                     item.Destroy();
             }
 
-            if (this is CombatPet combatPet)
-            {
-                if (combatPet.P_PetOwner != null && combatPet.P_PetOwner.CurrentActiveCombatPet == this)
-                    combatPet.P_PetOwner.CurrentActiveCombatPet = null;
-            }
+            if (this is Pet pet && pet.P_PetOwner?.CurrentActivePet == this)
+                pet.P_PetOwner.CurrentActivePet = null;
 
             if (raiseNotifyOfDestructionEvent)
                 NotifyOfEvent(RegenerationType.Destruction);
@@ -1060,14 +1081,6 @@ namespace ACE.Server.WorldObjects
                 return new List<WorldObject>();
             else
                 return new List<WorldObject>() { this };
-        }
-
-        /// <summary>
-        /// Returns the wielder or the current object
-        /// </summary>
-        public WorldObject GetCurrentOrWielder(Landblock landblock)
-        {
-            return WielderId != null ? landblock?.GetObject(WielderId.Value) : this;
         }
     }
 }

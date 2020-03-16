@@ -50,6 +50,10 @@ namespace ACE.Server.WorldObjects
             if (targetCreature == null)
                 return;*/
 
+            // verify before resist, still consumes source item
+            if (spell.MetaSpellType == SpellType.Dispel && !VerifyDispelPKStatus(caster, target))
+                return;
+
             // perform resistance check, if applicable
             var resisted = tryResist ? TryResistSpell(target, spell, caster) : false;
             if (resisted)
@@ -204,7 +208,7 @@ namespace ACE.Server.WorldObjects
             if (caster == target && spell.IsNegativeRedirectable)
                 return true;
 
-            if (targetCreature != null && spell.NonComponentTargetType == ItemType.Creature && !caster.CanDamage(targetCreature))
+            if (targetCreature != null && caster != targetCreature && spell.NonComponentTargetType == ItemType.Creature && !caster.CanDamage(targetCreature))
                 return true;
 
             // Cannot cast Weapon Aura spells on targets that are not players or creatures
@@ -342,11 +346,12 @@ namespace ACE.Server.WorldObjects
             var player = this as Player;
             var creature = this as Creature;
 
-            var spellTarget = spell.BaseRangeConstant > 0 ? target as Creature : creature;
-            var targetPlayer = spellTarget as Player;
+            var spellTarget = !spell.IsSelfTargeted ? target as Creature : creature;
 
             if (this is Gem || this is Hook)
                 spellTarget = target as Creature;
+
+            var targetPlayer = spellTarget as Player;
 
             // NonComponentTargetType should be 0 for untargeted spells.
             // Return if the spell type is targeted with no target defined or the target is already dead.
@@ -442,15 +447,27 @@ namespace ACE.Server.WorldObjects
                     // handle cloaks
                     if (spellTarget != this && spellTarget.IsAlive && srcVital != null && srcVital.Equals("health") && boost < 0 && spellTarget.HasCloakEquipped)
                     {
-                        // ensure message is sent after enchantment.Message
-                        var actionChain = new ActionChain();
-                        actionChain.AddDelayForOneTick();
-                        actionChain.AddAction(this, () =>
+
+                        if (spellTarget.HasCloakEquipped)
                         {
-                            var pct = (float)-boost / spellTarget.Health.MaxValue;
-                            Cloak.TryProcSpell(spellTarget, this, pct);
-                        });
-                        actionChain.EnqueueChain();
+                            // ensure message is sent after enchantment.Message
+                            var actionChain = new ActionChain();
+                            actionChain.AddDelayForOneTick();
+                            actionChain.AddAction(this, () =>
+                            {
+                                var pct = (float)-boost / spellTarget.Health.MaxValue;
+                                Cloak.TryProcSpell(spellTarget, this, pct);
+                            });
+                            actionChain.EnqueueChain();
+                        }
+
+                        // ensure emote process occurs after damage msg
+                        var emoteChain = new ActionChain();
+                        emoteChain.AddDelayForOneTick();
+                        emoteChain.AddAction(target, () => target.EmoteManager.OnDamage(player));
+                        //if (critical)
+                        //    emoteChain.AddAction(target, () => target.EmoteManager.OnReceiveCritical(player));
+                        emoteChain.EnqueueChain();
                     }
                     break;
 
@@ -586,17 +603,28 @@ namespace ACE.Server.WorldObjects
                         player.Session.Network.EnqueueSend(new GameEventUpdateHealth(player.Session, target.Guid.Full, (float)spellTarget.Health.Current / spellTarget.Health.MaxValue));
 
                     // handle cloaks
-                    if (spellTarget != this && spellTarget.IsAlive && srcVital != null && srcVital.Equals("health") && spellTarget.HasCloakEquipped)
+                    if (spellTarget != this && spellTarget.IsAlive && srcVital != null && srcVital.Equals("health"))
                     {
-                        // ensure message is sent after enchantment.Message
-                        var actionChain = new ActionChain();
-                        actionChain.AddDelayForOneTick();
-                        actionChain.AddAction(this, () =>
+                        if (spellTarget.HasCloakEquipped)
                         {
-                            var pct = (float)srcVitalChange / spellTarget.Health.MaxValue;
-                            Cloak.TryProcSpell(spellTarget, this, pct);
-                        });
-                        actionChain.EnqueueChain();
+                            // ensure message is sent after enchantment.Message
+                            var actionChain = new ActionChain();
+                            actionChain.AddDelayForOneTick();
+                            actionChain.AddAction(this, () =>
+                            {
+                                var pct = (float)srcVitalChange / spellTarget.Health.MaxValue;
+                                Cloak.TryProcSpell(spellTarget, this, pct);
+                            });
+                            actionChain.EnqueueChain();
+                        }
+
+                        // ensure emote process occurs after damage msg
+                        var emoteChain = new ActionChain();
+                        emoteChain.AddDelayForOneTick();
+                        emoteChain.AddAction(target, () => target.EmoteManager.OnDamage(player));
+                        //if (critical)
+                        //    emoteChain.AddAction(target, () => target.EmoteManager.OnReceiveCritical(player));
+                        emoteChain.EnqueueChain();
                     }
                     break;
 
@@ -691,6 +719,50 @@ namespace ACE.Server.WorldObjects
             enchantmentStatus.Success = true;
 
             return spellTarget?.IsDead ?? false;
+        }
+
+        public static bool VerifyDispelPKStatus(WorldObject caster, WorldObject target)
+        {
+            // https://asheron.fandom.com/wiki/Announcements_-_2004/04_-_A_New_Threat
+            // https://asheron.fandom.com/wiki/Dispel_Spells
+
+            // Dispel spells and potions have been revised. All dispels are also now tied to the PK/L timer.
+
+            // The feedback on the suggested dispel timer for PK/L was very mixed. There was no clear majority either for or against.
+            // With that in mind, we've gone ahead with the changes that we feel best improve majority of PK/L combat:
+            // we've decided to implement the PK/L timer on dispels.
+
+            // If you have been in a PK/L action within the last 20 seconds, you will not be able to:
+
+            // - Use a dispel gem.
+            // - Use a dispel potion.
+            // - Use the Awakener or Attenuated Awakener on someone else.
+            // - Cast any dispel spell on yourself.
+            // - Cast any dispel spell on someone else.
+
+            var casterPlayer = caster as Player;
+            var targetPlayer = (target.Wielder ?? target) as Player;
+
+            if (casterPlayer != null && casterPlayer.PKTimerActive)
+            {
+                casterPlayer.SendWeenieError(WeenieError.YouHaveBeenInPKBattleTooRecently);
+                return false;
+            }
+
+            if (targetPlayer != null && targetPlayer.PKTimerActive)
+            {
+                if (casterPlayer != null || caster is Gem || caster is Food)
+                {
+                    if (casterPlayer != null)
+                        casterPlayer.Session.Network.EnqueueSend(new GameMessageSystemChat($"{targetPlayer.Name} has been involved in a player killer battle too recently to do that!", ChatMessageType.Magic));
+                    else
+                        targetPlayer.SendWeenieError(WeenieError.YouHaveBeenInPKBattleTooRecently);
+
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -1102,7 +1174,9 @@ namespace ACE.Server.WorldObjects
         /// </summary>
         private Portal GetPortal(uint wcid)
         {
-            return WorldObjectFactory.CreateWorldObject(DatabaseManager.World.GetCachedWeenie(wcid), new ObjectGuid(wcid)) as Portal;
+            var weenie = DatabaseManager.World.GetCachedWeenie(wcid);
+
+            return WorldObjectFactory.CreateWorldObject(weenie, new ObjectGuid(wcid)) as Portal;
         }
 
         /// <summary>
@@ -1271,6 +1345,8 @@ namespace ACE.Server.WorldObjects
 
         public static readonly Quaternion OneEighty = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, (float)Math.PI);
 
+        public static readonly float ProjHeightArc = 5.0f / 6.0f;
+
         /// <summary>
         /// Calculates the spell projectile velocity in global space
         /// </summary>
@@ -1291,12 +1367,20 @@ namespace ACE.Server.WorldObjects
             var startPos = strikeSpell ? target.Location.Pos : crossLandblock ? Location.ToGlobal(false) : Location.Pos;
             startPos += Vector3.Transform(origin, strikeSpell ? Location.Rotation * OneEighty : Location.Rotation);
 
-            var endPos = crossLandblock ? target.Location.ToGlobal(false) : target.Location.Pos;
-            endPos.Z += target.Height * 0.5f;
+            var targetLoc = target.Location;
+
+            if (target.PhysicsObj != null)
+            {
+                var targetPos = target.PhysicsObj.Position;
+                targetLoc = new Position(targetPos.ObjCellID, targetPos.Frame.Origin, targetPos.Frame.Orientation);
+            }
+
+            var endPos = crossLandblock ? targetLoc.ToGlobal(false) : targetLoc.Pos;
+
+            endPos.Z += target.Height * (spellType == ProjectileSpellType.Arc ? ProjHeightArc : ProjHeight);
 
             var dir = Vector3.Normalize(endPos - startPos);
 
-            // TODO: change to instantaneous velocity
             var targetVelocity = spell.IsTracking ? target.PhysicsObj.CachedVelocity : Vector3.Zero;
 
             var useGravity = spellType == ProjectileSpellType.Arc;
@@ -1348,6 +1432,11 @@ namespace ACE.Server.WorldObjects
                     sp.Velocity = Vector3.Transform(velocity, q);
                 }
 
+                // set orientation
+                var dir = Vector3.Normalize(sp.Velocity.Value);
+                sp.PhysicsObj.Position.Frame.set_vector_heading(dir);
+                sp.Location.Rotation = sp.PhysicsObj.Position.Frame.Orientation;
+
                 sp.ProjectileSource = this;
                 sp.Caster = caster;
 
@@ -1398,17 +1487,16 @@ namespace ACE.Server.WorldObjects
                 return 0.0f;
             }
 
-            var setupId = weenie.WeeniePropertiesDID.FirstOrDefault(i => i.Type == (ushort)PropertyDataId.Setup);
-
-            if (setupId == null)
+            if (!weenie.PropertiesDID.TryGetValue(PropertyDataId.Setup, out var setupId))
             {
-                log.Error($"{Name} ({Guid}).GetSetupRadius({spell.Id} - {spell.Name}): couldn't find setup ID for {weenie.ClassId} - {weenie.ClassName}");
+                log.Error($"{Name} ({Guid}).GetSetupRadius({spell.Id} - {spell.Name}): couldn't find setup ID for {weenie.WeenieClassId} - {weenie.ClassName}");
                 return 0.0f;
             }
 
-            var setup = DatManager.PortalDat.ReadFromDat<SetupModel>(setupId.Value);
+            var setup = DatManager.PortalDat.ReadFromDat<SetupModel>(setupId);
 
-            var scale = weenie.WeeniePropertiesFloat.FirstOrDefault(i => i.Type == (ushort)PropertyFloat.DefaultScale)?.Value ?? 1.0f;
+            if (!weenie.PropertiesFloat.TryGetValue(PropertyFloat.DefaultScale, out var scale))
+                scale = 1.0f;
 
             return ProjectileRadiusCache[projectileWcid] = (float)(setup.Spheres[0].Radius * scale);
         }
@@ -1437,15 +1525,13 @@ namespace ACE.Server.WorldObjects
                     return 0.0f;
                 }
 
-                var maxVelocity = weenie.WeeniePropertiesFloat.FirstOrDefault(i => i.Type == (ushort)PropertyFloat.MaximumVelocity);
-
-                if (maxVelocity == null)
+                if (!weenie.PropertiesFloat.TryGetValue(PropertyFloat.MaximumVelocity, out var maxVelocity))
                 {
-                    log.Error($"{Name} ({Guid}).GetSpellProjectileSpeed({spell.Id} - {spell.Name}, {distance}): couldn't find MaxVelocity for {weenie.ClassId} - {weenie.ClassName}");
+                    log.Error($"{Name} ({Guid}).GetSpellProjectileSpeed({spell.Id} - {spell.Name}, {distance}): couldn't find MaxVelocity for {weenie.WeenieClassId} - {weenie.ClassName}");
                     return 0.0f;
                 }
 
-                baseSpeed = (float)maxVelocity.Value;
+                baseSpeed = (float)maxVelocity;
 
                 ProjectileSpeedCache[projectileWcid] = baseSpeed;
             }

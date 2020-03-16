@@ -92,7 +92,7 @@ namespace ACE.Server.Physics
 
         // this is used by the 1991 branch to determine when physics updates need to be run
         public bool IsMovingOrAnimating => !PartArray.Sequence.is_first_cyclic() || CachedVelocity != Vector3.Zero || Velocity != Vector3.Zero ||
-            MovementManager.MotionInterpreter.InterpretedState.HasCommands();
+            MovementManager.MotionInterpreter.InterpretedState.HasCommands() || MovementManager.MoveToManager.Initialized;
 
         // server
         public Position RequestPos;
@@ -2261,7 +2261,19 @@ namespace ACE.Server.Physics
                 foreach (var obj in newlyVisible)
                 {
                     var wo = obj.WeenieObj.WorldObject;
-                    if (wo != null)
+
+                    if (wo == null)
+                        continue;
+
+                    if (wo.Teleporting)
+                    {
+                        // ensure post-teleport position is sent
+                        var actionChain = new ActionChain();
+                        actionChain.AddDelayForOneTick();
+                        actionChain.AddAction(player, () => player.TrackObject(wo));
+                        actionChain.EnqueueChain();
+                    }
+                    else
                         player.TrackObject(wo);
                 }
             }
@@ -2285,7 +2297,16 @@ namespace ACE.Server.Physics
             }
             else
             {
-                player.TrackObject(wo);
+                if (wo.Teleporting)
+                {
+                    // ensure post-teleport position is sent
+                    var actionChain = new ActionChain();
+                    actionChain.AddDelayForOneTick();
+                    actionChain.AddAction(player, () => player.TrackObject(wo));
+                    actionChain.EnqueueChain();
+                }
+                else
+                    player.TrackObject(wo);
             }
         }
 
@@ -4150,6 +4171,11 @@ namespace ACE.Server.Physics
             Console.WriteLine($"{Name} pending motions:");
             foreach (var motion in MovementManager.MotionInterpreter.PendingMotions)
                 Console.WriteLine($"{(MotionCommand)motion.Motion}");
+        }
+
+        public bool motions_pending()
+        {
+            return IsAnimating;
         }
 
         /// <summary>
